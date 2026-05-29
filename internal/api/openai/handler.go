@@ -18,18 +18,18 @@ type Handler struct {
 }
 
 type chatMessage struct {
-	Role     string           `json:"role"`
-	Content  any              `json:"content"`
-	Name     string           `json:"name,omitempty"`
+	Role      string           `json:"role"`
+	Content   any              `json:"content"`
+	Name      string           `json:"name,omitempty"`
 	ToolCalls []parsedToolCall `json:"tool_calls,omitempty"`
 }
 
 type chatRequest struct {
-	Model      string       `json:"model"`
+	Model      string        `json:"model"`
 	Messages   []chatMessage `json:"messages"`
-	Stream     bool         `json:"stream"`
-	Tools      []toolSpec   `json:"tools"`
-	ToolChoice any          `json:"tool_choice"`
+	Stream     bool          `json:"stream"`
+	Tools      []toolSpec    `json:"tools"`
+	ToolChoice any           `json:"tool_choice"`
 }
 
 type responseInputFunctionCallOutput struct {
@@ -47,13 +47,19 @@ func NewHandler(_ any) http.Handler {
 		os.Getenv("GEMINI_WEB2API_GEMINI_WEB_BASE"),
 	)
 	upstream := gemini.NewClient(gemini.Config{
-		Client:     transportClient,
-		ProxyBase:  os.Getenv("GEMINI_WEB2API_GEMINI_WEB_BASE"),
-		ProxyBases: bases,
-		BL:         os.Getenv("GEMINI_WEB2API_GEMINI_BL"),
-		Cookie:     "",
-		SAPISID:    "",
-		EnableAuth: false,
+		Client:           transportClient,
+		ProxyBase:        os.Getenv("GEMINI_WEB2API_GEMINI_WEB_BASE"),
+		ProxyBases:       bases,
+		ResinEndpoint:    os.Getenv("RESIN_ENDPOINT"),
+		ResinMode:        os.Getenv("RESIN_MODE"),
+		ResinAuthVersion: os.Getenv("RESIN_AUTH_VERSION"),
+		ResinProxyToken:  os.Getenv("RESIN_PROXY_TOKEN"),
+		ResinPlatform:    os.Getenv("RESIN_PLATFORM"),
+		ResinAccount:     os.Getenv("RESIN_ACCOUNT"),
+		BL:               os.Getenv("GEMINI_WEB2API_GEMINI_BL"),
+		Cookie:           "",
+		SAPISID:          "",
+		EnableAuth:       false,
 		Pool: gemini.PoolConfig{
 			ExploreRatio:  parseEnvFloat("GEMINI_WEB2API_NODE_EXPLORE_RATIO", 0.08),
 			FailThreshold: parseEnvInt("GEMINI_WEB2API_NODE_FAIL_THRESHOLD", 2),
@@ -268,10 +274,10 @@ func (h *Handler) handleResponses(w http.ResponseWriter, r *http.Request) {
 			switch itemType {
 			case "function_call":
 				writeSSEEvent(w, "response.function_call_arguments.done", map[string]any{
-					"type":     "response.function_call_arguments.done",
-					"item_id":  item["id"],
-					"call_id":  item["call_id"],
-					"name":     item["name"],
+					"type":      "response.function_call_arguments.done",
+					"item_id":   item["id"],
+					"call_id":   item["call_id"],
+					"name":      item["name"],
 					"arguments": item["arguments"],
 				})
 			case "message":
@@ -310,12 +316,12 @@ func (h *Handler) handleResponses(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"id":        rid,
-		"object":    "response",
+		"id":         rid,
+		"object":     "response",
 		"created_at": time.Now().Unix(),
-		"status":    "completed",
-		"model":     resolved.Name,
-		"output":    output,
+		"status":     "completed",
+		"model":      resolved.Name,
+		"output":     output,
 		"usage": map[string]any{
 			"input_tokens":  len(prompt) / 4,
 			"output_tokens": len(cleanText) / 4,

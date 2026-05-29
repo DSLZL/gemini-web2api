@@ -21,12 +21,12 @@ type Handler struct {
 }
 
 type generateContentRequest struct {
-	Contents          []googleContent           `json:"contents"`
-	SystemInstruction googleSystemInstruction   `json:"systemInstruction"`
-	Tools             []googleToolDeclGroup     `json:"tools"`
-	ToolConfig        googleToolConfig          `json:"toolConfig"`
-	GenerationConfig  map[string]any            `json:"generationConfig"`
-	SafetySettings    []map[string]any          `json:"safetySettings"`
+	Contents          []googleContent         `json:"contents"`
+	SystemInstruction googleSystemInstruction `json:"systemInstruction"`
+	Tools             []googleToolDeclGroup   `json:"tools"`
+	ToolConfig        googleToolConfig        `json:"toolConfig"`
+	GenerationConfig  map[string]any          `json:"generationConfig"`
+	SafetySettings    []map[string]any        `json:"safetySettings"`
 }
 
 // NewHandler creates the Google native endpoint handler.
@@ -37,13 +37,19 @@ func NewHandler(_ any) http.Handler {
 		os.Getenv("GEMINI_WEB2API_GEMINI_WEB_BASE"),
 	)
 	upstream := gemini.NewClient(gemini.Config{
-		Client:     transportClient,
-		ProxyBase:  os.Getenv("GEMINI_WEB2API_GEMINI_WEB_BASE"),
-		ProxyBases: bases,
-		BL:         os.Getenv("GEMINI_WEB2API_GEMINI_BL"),
-		Cookie:     "",
-		SAPISID:    "",
-		EnableAuth: false,
+		Client:           transportClient,
+		ProxyBase:        os.Getenv("GEMINI_WEB2API_GEMINI_WEB_BASE"),
+		ProxyBases:       bases,
+		ResinEndpoint:    os.Getenv("RESIN_ENDPOINT"),
+		ResinMode:        os.Getenv("RESIN_MODE"),
+		ResinAuthVersion: os.Getenv("RESIN_AUTH_VERSION"),
+		ResinProxyToken:  os.Getenv("RESIN_PROXY_TOKEN"),
+		ResinPlatform:    os.Getenv("RESIN_PLATFORM"),
+		ResinAccount:     os.Getenv("RESIN_ACCOUNT"),
+		BL:               os.Getenv("GEMINI_WEB2API_GEMINI_BL"),
+		Cookie:           "",
+		SAPISID:          "",
+		EnableAuth:       false,
 		Pool: gemini.PoolConfig{
 			ExploreRatio:  parseEnvFloat("GEMINI_WEB2API_NODE_EXPLORE_RATIO", 0.08),
 			FailThreshold: parseEnvInt("GEMINI_WEB2API_NODE_FAIL_THRESHOLD", 2),

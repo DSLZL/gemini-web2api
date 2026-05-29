@@ -11,6 +11,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"gemini-web2api/internal/proxy/resin"
 )
 
 func TestGenerate_UsesContextCancellation(t *testing.T) {
@@ -239,5 +241,94 @@ func TestGenerate_AppliesExtraFieldsToPayload(t *testing.T) {
 	}
 	if got := capturedInner[80]; got != float64(3) {
 		t.Fatalf("unexpected extra field 80: %#v", got)
+	}
+}
+
+func TestGenerate_ResinReverseUsesEndpointAndAccountHeader(t *testing.T) {
+	t.Parallel()
+
+	var gotPath string
+	var gotAccount string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		gotAccount = r.Header.Get("X-Resin-Account")
+		inner := make([]any, 5)
+		inner[4] = []any{
+			[]any{nil, []any{"resin reverse ok"}},
+		}
+		innerJSON, _ := json.Marshal(inner)
+		line := []any{
+			[]any{"wrb.fr", nil, string(innerJSON)},
+		}
+		lineJSON, _ := json.Marshal(line)
+		_, _ = w.Write([]byte(string(lineJSON) + "\n"))
+	}))
+	defer srv.Close()
+
+	client := NewClient(Config{
+		Client:           srv.Client(),
+		ResinEndpoint:    srv.URL,
+		ResinMode:        "reverse",
+		ResinAuthVersion: "V1",
+		ResinProxyToken:  "tok",
+		ResinPlatform:    "Nimbus",
+		ResinAccount:     "Tom",
+	})
+	got, err := client.Generate(context.Background(), "hello", 1, 4, nil)
+	if err != nil {
+		t.Fatalf("generate error: %v", err)
+	}
+	if got != "resin reverse ok" {
+		t.Fatalf("unexpected generated text: got %q", got)
+	}
+	if !strings.Contains(gotPath, "/tok/Nimbus.Tom/https/gemini.google.com/_/BardChatUi/data/assistant.lamda.BardFrontendService/StreamGenerate") {
+		t.Fatalf("unexpected reverse path: %q", gotPath)
+	}
+	if gotAccount != "Tom" {
+		t.Fatalf("unexpected X-Resin-Account header: %q", gotAccount)
+	}
+}
+
+func TestGenerate_ResinForwardBuildsProxyAuthorization(t *testing.T) {
+	t.Parallel()
+
+	proxyURL, err := proxyURLFromResin(resin.Config{
+		Endpoint:    "http://127.0.0.1:2260",
+		Mode:        "forward",
+		ProxyToken:  "tok",
+		AuthVersion: "V1",
+	}, resin.Identity{
+		Platform: "Nimbus",
+		Account:  "Tom",
+	})
+	if err != nil {
+		t.Fatalf("build proxy URL failed: %v", err)
+	}
+	user := ""
+	pass := ""
+	if proxyURL.User != nil {
+		user = proxyURL.User.Username()
+		pass, _ = proxyURL.User.Password()
+	}
+	if user != "Nimbus.Tom" {
+		t.Fatalf("unexpected proxy user: %q", user)
+	}
+	if pass != "tok" {
+		t.Fatalf("unexpected proxy password: %q", pass)
+	}
+}
+
+func TestGenerate_ResinReverseRequiresEndpoint(t *testing.T) {
+	t.Parallel()
+
+	client := NewClient(Config{
+		ResinMode: "reverse",
+	})
+	_, err := client.Generate(context.Background(), "hello", 1, 4, nil)
+	if err == nil {
+		t.Fatal("expected resin reverse endpoint validation error")
+	}
+	if !strings.Contains(err.Error(), "resin endpoint is required for reverse mode") {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }

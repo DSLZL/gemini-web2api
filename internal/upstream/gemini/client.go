@@ -3,6 +3,7 @@ package gemini
 import (
 	"context"
 	"crypto/sha1"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -14,6 +15,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"gemini-web2api/internal/proxy/resin"
 )
 
 const defaultBL = "boq_assistant-bard-web-server_20260525.09_p0"
@@ -28,14 +31,20 @@ var (
 
 // Config defines Gemini web upstream settings.
 type Config struct {
-	Client     *http.Client
-	BL         string
-	ProxyBase  string
-	ProxyBases []string
-	Cookie     string
-	SAPISID    string
-	EnableAuth bool
-	Pool       PoolConfig
+	Client           *http.Client
+	BL               string
+	ProxyBase        string
+	ProxyBases       []string
+	ResinEndpoint    string
+	ResinMode        string
+	ResinAuthVersion string
+	ResinProxyToken  string
+	ResinPlatform    string
+	ResinAccount     string
+	Cookie           string
+	SAPISID          string
+	EnableAuth       bool
+	Pool             PoolConfig
 }
 
 // Client calls Gemini web StreamGenerate endpoint.
@@ -44,6 +53,9 @@ type Client struct {
 	bl        string
 	proxyBase string
 	pool      *NodePool
+	resinCfg  resin.Config
+	resinID   resin.Identity
+	resinOn   bool
 	cookie    string
 	sapisid   string
 	auth      bool
@@ -71,11 +83,34 @@ func NewClient(cfg Config) *Client {
 		pool = NewNodePool([]string{base}, cfg.Pool)
 	}
 
+	resinCfg := resin.Config{
+		Endpoint:    strings.TrimSpace(cfg.ResinEndpoint),
+		Mode:        strings.TrimSpace(cfg.ResinMode),
+		AuthVersion: strings.TrimSpace(cfg.ResinAuthVersion),
+		ProxyToken:  strings.TrimSpace(cfg.ResinProxyToken),
+	}
+	resinID := resin.Identity{
+		Platform: strings.TrimSpace(cfg.ResinPlatform),
+		Account:  strings.TrimSpace(cfg.ResinAccount),
+	}
+	resinOn := resinCfg.Mode != ""
+	if resinOn && resinCfg.Mode != "reverse" {
+		proxyURL, err := proxyURLFromResin(resinCfg, resinID)
+		if err != nil {
+			resinOn = false
+		} else {
+			httpClient = cloneHTTPClientWithProxy(httpClient, proxyURL)
+		}
+	}
+
 	return &Client{
 		http:      httpClient,
 		bl:        bl,
 		proxyBase: base,
 		pool:      pool,
+		resinCfg:  resinCfg,
+		resinID:   resinID,
+		resinOn:   resinOn,
 		cookie:    strings.TrimSpace(cfg.Cookie),
 		sapisid:   strings.TrimSpace(cfg.SAPISID),
 		auth:      cfg.EnableAuth,
@@ -195,6 +230,16 @@ func (c *Client) streamGenerate(ctx context.Context, prompt string, mode, think 
 	}
 	target = target + "?bl=" + url.QueryEscape(c.bl) + "&hl=en&_reqid=" + strconv.FormatInt(reqID, 10) + "&rt=c"
 
+	resinHeaders := make(http.Header)
+	if c.resinOn {
+		outURL, outHeaders, err := resin.BuildOutbound(c.resinCfg, c.resinID, target)
+		if err != nil {
+			return "", fmt.Errorf("build resin outbound: %w", err)
+		}
+		target = outURL
+		resinHeaders = outHeaders
+	}
+
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, target, strings.NewReader(form.Encode()))
 	if err != nil {
 		return "", fmt.Errorf("build stream request: %w", err)
@@ -204,6 +249,11 @@ func (c *Client) streamGenerate(ctx context.Context, prompt string, mode, think 
 	req.Header.Set("Referer", "https://gemini.google.com/app")
 	req.Header.Set("X-Same-Domain", "1")
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+	for key, values := range resinHeaders {
+		for _, value := range values {
+			req.Header.Add(key, value)
+		}
+	}
 	if c.cookie != "" {
 		req.Header.Set("Cookie", c.cookie)
 	}
@@ -321,4 +371,109 @@ func uuidString() string {
 		uint16(now>>48),
 		uint64(now)&0xFFFFFFFFFFFF,
 	)
+}
+
+func proxyURLFromResin(cfg resin.Config, id resin.Identity) (*url.URL, error) {
+	mode := strings.ToLower(strings.TrimSpace(cfg.Mode))
+	endpoint := strings.TrimSpace(cfg.Endpoint)
+	if endpoint == "" {
+		return nil, errors.New("resin endpoint is required")
+	}
+	raw := endpoint
+	if !strings.Contains(raw, "://") {
+		if mode == "socks5" {
+			raw = "socks5://" + raw
+		} else {
+			raw = "http://" + raw
+		}
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return nil, fmt.Errorf("parse resin endpoint: %w", err)
+	}
+
+	if mode == "forward" || mode == "connect" {
+		user, err := proxyAuthUserForMode(cfg, id)
+		if err != nil {
+			return nil, err
+		}
+		u.User = url.UserPassword(user, strings.TrimSpace(cfg.ProxyToken))
+		return u, nil
+	}
+	if mode == "socks5" {
+		if strings.ToUpper(strings.TrimSpace(cfg.AuthVersion)) != "V1" {
+			return nil, errors.New("socks5 requires RESIN_AUTH_VERSION=V1")
+		}
+		return u, nil
+	}
+	return u, nil
+}
+
+func proxyAuthUserForMode(cfg resin.Config, id resin.Identity) (string, error) {
+	authVersion := strings.ToUpper(strings.TrimSpace(cfg.AuthVersion))
+	platform := strings.TrimSpace(id.Platform)
+	account := strings.TrimSpace(id.Account)
+	switch authVersion {
+	case "":
+		fallthrough
+	case "V1":
+		if platform == "" && account == "" {
+			return "", nil
+		}
+		if platform == "" {
+			return account, nil
+		}
+		if account == "" {
+			return platform, nil
+		}
+		return platform + "." + account, nil
+	case "LEGACY_V0":
+		if account != "" {
+			return account, nil
+		}
+		if platform != "" {
+			return platform, nil
+		}
+		return "", errors.New("legacy auth requires account or platform")
+	default:
+		return "", fmt.Errorf("invalid resin auth version: %s", cfg.AuthVersion)
+	}
+}
+
+func cloneHTTPClientWithProxy(base *http.Client, proxyURL *url.URL) *http.Client {
+	if base == nil {
+		base = http.DefaultClient
+	}
+	cloned := *base
+
+	var transport *http.Transport
+	switch t := base.Transport.(type) {
+	case *http.Transport:
+		transport = t.Clone()
+	default:
+		if def, ok := http.DefaultTransport.(*http.Transport); ok {
+			transport = def.Clone()
+		}
+	}
+	if transport == nil {
+		transport = &http.Transport{}
+	}
+	transport.Proxy = http.ProxyURL(proxyURL)
+
+	authHeader := ""
+	if proxyURL.User != nil {
+		user := proxyURL.User.Username()
+		pass, _ := proxyURL.User.Password()
+		token := base64.StdEncoding.EncodeToString([]byte(user + ":" + pass))
+		authHeader = "Basic " + token
+	}
+	if authHeader != "" {
+		if transport.ProxyConnectHeader == nil {
+			transport.ProxyConnectHeader = make(http.Header)
+		}
+		transport.ProxyConnectHeader.Set("Proxy-Authorization", authHeader)
+	}
+
+	cloned.Transport = transport
+	return &cloned
 }

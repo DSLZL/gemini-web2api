@@ -33,7 +33,7 @@ Use `.env.example` as template.
 - `HTTPS_PROXY` / `HTTP_PROXY` (optional upstream proxy)
 - `GEMINI_WEB2API_GEMINI_WEB_BASE` (optional custom Gemini web base)
 - `GEMINI_WEB2API_GEMINI_BL` (optional BL override)
-- `RESIN_MODE`, `RESIN_AUTH_VERSION`, `RESIN_PLATFORM`, `RESIN_ACCOUNT`, `RESIN_PROXY_TOKEN`
+- `RESIN_ENDPOINT`, `RESIN_MODE`, `RESIN_AUTH_VERSION`, `RESIN_PLATFORM`, `RESIN_ACCOUNT`, `RESIN_PROXY_TOKEN`
 
 ## Client Configuration
 
