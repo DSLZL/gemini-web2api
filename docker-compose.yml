@@ -1,0 +1,18 @@
+services:
+  gemini-web2api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: gemini-web2api
+    restart: unless-stopped
+    ports:
+      - "8081:8081"
+    environment:
+      GEMINI_WEB2API_ADDR: ":8081"
+      GEMINI_API_KEY: "${GEMINI_API_KEY:-}"
+      GOOGLE_GEMINI_BASE_URL: "${GOOGLE_GEMINI_BASE_URL:-}"
+      RESIN_MODE: "${RESIN_MODE:-reverse}"
+      RESIN_PLATFORM: "${RESIN_PLATFORM:-}"
+      RESIN_ACCOUNT: "${RESIN_ACCOUNT:-}"
+      RESIN_AUTH_VERSION: "${RESIN_AUTH_VERSION:-V1}"
+      RESIN_PROXY_TOKEN: "${RESIN_PROXY_TOKEN:-}"

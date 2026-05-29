@@ -6,58 +6,44 @@
 
 [中文文档](README_CN.md)
 
-Convert Google Gemini's web interface into an OpenAI-compatible API. Zero authentication, zero cost, cross-platform.
+Go-based OpenAI-compatible gateway for Gemini Web StreamGenerate.
 
 ## Features
 
-- **Zero Auth**: No API key, no Google account needed (anonymous access)
-- **OpenAI Compatible**: Drop-in replacement for `/v1/chat/completions` and `/v1/models`
-- **Tool Calling**: Full function calling support (OpenAI format)
-- **Multiple Models**: Flash, Flash Thinking (20k+ char output), Pro, Auto, Lite
-- **Thinking Depth**: Adjustable via `@think=N` suffix (0=deepest, 4=shallowest)
-- **Web Search**: Built-in internet access (Gemini's native search)
-- **Cross-Platform**: Pure Python, no dependencies beyond stdlib
-- **Streaming**: SSE streaming support
-- **Codex CLI**: Responses API (`/v1/responses`) for OpenAI Codex integration
-- **Gemini CLI**: Google native API (`/v1beta/models`) for Gemini CLI compatibility
+- **OpenAI Compatible**: `/v1/chat/completions`, `/v1/models`, `/v1/responses`
+- **Google Native Compatible**: `/v1beta/models`, `:generateContent`, `:streamGenerateContent`
+- **Anonymous Model Policy**: excludes Pro model and legacy cookie path
+- **Thinking Depth Suffixes**: `-low/-medium/-high/-xhigh/-max` (no `@think`)
+- **Resin Integration**: supports `reverse|forward|connect|socks5`
+- **High-Concurrency Transport**: tuned `http.Transport` defaults
 
 ## Quick Start
 
 ```bash
-python gemini_web2api.py
+go run ./cmd/gemini-web2api
 ```
 
-Server starts at `http://localhost:8081/v1`.
+Default listen address: `:8081` (OpenAI base URL: `http://localhost:8081/v1`)
+
+## Environment Variables
+
+Use `.env.example` as template.
+
+- `GEMINI_WEB2API_ADDR` (default `:8081`)
+- `HTTPS_PROXY` / `HTTP_PROXY` (optional upstream proxy)
+- `GEMINI_WEB2API_GEMINI_WEB_BASE` (optional custom Gemini web base)
+- `GEMINI_WEB2API_GEMINI_BL` (optional BL override)
+- `RESIN_MODE`, `RESIN_AUTH_VERSION`, `RESIN_PLATFORM`, `RESIN_ACCOUNT`, `RESIN_PROXY_TOKEN`
 
 ## Client Configuration
 
-### Cherry Studio / ChatBox / any OpenAI client
+### OpenAI-compatible clients (Cherry Studio / ChatBox / SDK)
 
 | Field | Value |
 |-------|-------|
 | Base URL | `http://localhost:8081/v1` |
-| API Key | `none` (or anything) |
+| API Key | `none` |
 | Model | `gemini-3.5-flash-thinking` |
-
-### curl
-
-```bash
-curl http://localhost:8081/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{"model":"gemini-3.5-flash","messages":[{"role":"user","content":"Hello!"}]}'
-```
-
-### OpenAI Python SDK
-
-```python
-from openai import OpenAI
-client = OpenAI(base_url="http://localhost:8081/v1", api_key="none")
-resp = client.chat.completions.create(
-    model="gemini-3.5-flash-thinking",
-    messages=[{"role": "user", "content": "Explain quantum computing"}]
-)
-print(resp.choices[0].message.content)
-```
 
 ### Gemini CLI
 
@@ -67,132 +53,18 @@ export GOOGLE_GEMINI_BASE_URL=http://localhost:8081
 gemini
 ```
 
-Supports Google native API endpoints:
-- `GET /v1beta/models` — list models
-- `POST /v1beta/models/{model}:generateContent` — non-streaming
-- `POST /v1beta/models/{model}:streamGenerateContent` — streaming (SSE)
+## Proxy Example
 
-## Available Models
-
-| Model | Description | Output |
-|-------|-------------|--------|
-| `gemini-3.5-flash` | Fast general-purpose | ~12k chars |
-| `gemini-3.5-flash-thinking` | Deep thinking, longest output | **~20k chars** |
-| `gemini-3.5-flash-thinking-lite` | Adaptive thinking depth | ~15k chars |
-| `gemini-3.1-pro` | Pro (needs cookie for real routing) | ~12k chars |
-| `gemini-auto` | Auto model selection | varies |
-| `gemini-flash-lite` | Lightweight fast | ~10k chars |
-
-### Thinking Depth
-
-Append `@think=N` to any model name:
-
-```
-gemini-3.5-flash-thinking@think=0   # deepest (default)
-gemini-3.5-flash-thinking@think=2   # medium
-gemini-3.5-flash-thinking@think=4   # shallowest
-```
-
-## Optional: Cookie for Pro
-
-Anonymous access works for all models, but `gemini-3.1-pro` routes to Flash without authentication. To get real Pro routing, provide a cookie file:
-
-```bash
-python gemini_web2api.py --cookie-file cookie.txt
-```
-
-### How to get cookies
-
-1. Open Chrome, go to [gemini.google.com](https://gemini.google.com) and sign in with any free Google account
-2. Open DevTools (F12) → Application → Cookies → `https://gemini.google.com`
-3. Copy these cookie values: `SID`, `HSID`, `SSID`, `APISID`, `SAPISID`, `__Secure-1PSID`
-4. Create `cookie.txt` in this format:
-
-```
-SID=your_sid_value; HSID=your_hsid_value; SSID=your_ssid_value; APISID=your_apisid_value; SAPISID=your_sapisid_value; __Secure-1PSID=your_1psid_value
-```
-
-Or use the JSON format:
-```json
-{"cookie": "SID=xxx; HSID=xxx; SSID=xxx; APISID=xxx; SAPISID=xxx; __Secure-1PSID=xxx", "sapisid": "your_sapisid_value"}
-```
-
-**Alternative (browser extension)**: Use any "Export Cookies" extension to export cookies for `gemini.google.com` in Netscape format, then convert to the single-line format above.
-
-No paid subscription needed — a free Google account is sufficient.
-
-## Configuration
-
-Create `config.json` in the same directory:
-
-```json
-{
-  "port": 8081,
-  "host": "0.0.0.0",
-  "retry_attempts": 3,
-  "retry_delay_sec": 2,
-  "request_timeout_sec": 180,
-  "cookie_file": null,
-  "proxy": null,
-  "log_requests": true
-}
-```
-
-## Proxy
-
-If you cannot access `gemini.google.com` directly (connection timeout), configure a proxy:
-
-**Method 1: CLI argument**
-```bash
-python gemini_web2api.py --proxy http://127.0.0.1:7890
-```
-
-**Method 2: config.json**
-```json
-{"proxy": "http://127.0.0.1:7890"}
-```
-
-**Method 3: Environment variable** (auto-detected)
 ```bash
 export HTTPS_PROXY=http://127.0.0.1:7890
-python gemini_web2api.py
+go run ./cmd/gemini-web2api
 ```
 
-Works with Clash, V2Ray, Shadowsocks, or any HTTP proxy.
+## Development
 
-## Tool Calling
-
-```python
-resp = client.chat.completions.create(
-    model="gemini-3.5-flash",
-    messages=[{"role": "user", "content": "What's the weather in Tokyo?"}],
-    tools=[{
-        "type": "function",
-        "function": {
-            "name": "get_weather",
-            "description": "Get weather for a city",
-            "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}
-        }
-    }]
-)
+```bash
+go test ./... -v
 ```
-
-## Requirements
-
-- Python 3.8+
-- No external dependencies (stdlib only)
-- Network access to `gemini.google.com` (proxy/VPN may be needed in some regions)
-
-## How It Works
-
-This tool reverse-engineers Google Gemini's web StreamGenerate protocol. It sends requests to the same endpoint that the Gemini web app uses, converting between OpenAI's API format and Gemini's internal protobuf-like format.
-
-The model selection is controlled by field `[79]` in the request payload, mapped from Gemini's frontend JavaScript source (`MODE_CATEGORY` enum).
-
-## Acknowledgments
-
-- [linux.do](https://linux.do) community
-- Inspired by the open-source API proxy ecosystem
 
 ## License
 
