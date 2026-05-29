@@ -1,13 +1,20 @@
 package models
 
 import (
+	"errors"
 	"fmt"
-	"strconv"
 	"strings"
 )
 
 // DefaultModelName is used when client passes unknown/empty model name.
 const DefaultModelName = "gemini-3.5-flash"
+
+var (
+	errLegacyThink            = errors.New("legacy @think is not supported; use suffix: -low/-medium/-high/-xhigh/-max")
+	errProModel               = errors.New("model gemini-3.1-pro is not available")
+	errUnknown                = errors.New("unknown model")
+	errUnsupportedThinkSuffix = errors.New("unsupported think suffix")
+)
 
 // Resolved describes the final model config used for one upstream call.
 type Resolved struct {
@@ -32,35 +39,21 @@ var modelConfigs = map[string]config{
 	},
 	"gemini-3.5-flash-thinking": {
 		Mode:        2,
-		Think:       0,
+		Think:       4,
 		Description: "Deep thinking mode",
 	},
-	"gemini-3.1-pro": {
-		Mode:        3,
-		Think:       4,
-		Description: "Pro model",
-	},
-	"gemini-3.1-pro-enhanced": {
-		Mode:        3,
-		Think:       4,
-		Description: "Pro with enhanced output",
-		ExtraFields: map[int]any{
-			31: 2,
-			80: 3,
-		},
-	},
 	"gemini-auto": {
-		Mode:        4,
+		Mode:        3,
 		Think:       4,
 		Description: "Auto model selection",
 	},
 	"gemini-3.5-flash-thinking-lite": {
-		Mode:        5,
-		Think:       0,
+		Mode:        4,
+		Think:       4,
 		Description: "Dynamic thinking with adaptive depth",
 	},
 	"gemini-flash-lite": {
-		Mode:        6,
+		Mode:        5,
 		Think:       4,
 		Description: "Lightweight fast model",
 	},
@@ -69,8 +62,11 @@ var modelConfigs = map[string]config{
 var publicModelOrder = []string{
 	"gemini-3.5-flash",
 	"gemini-3.5-flash-thinking",
-	"gemini-3.1-pro",
-	"gemini-3.1-pro-enhanced",
+	"gemini-3.5-flash-thinking-max",
+	"gemini-3.5-flash-thinking-xhigh",
+	"gemini-3.5-flash-thinking-high",
+	"gemini-3.5-flash-thinking-medium",
+	"gemini-3.5-flash-thinking-low",
 	"gemini-auto",
 	"gemini-3.5-flash-thinking-lite",
 	"gemini-flash-lite",
@@ -88,55 +84,51 @@ var suffixThink = map[string]int{
 // Resolve parses model name and think override.
 //
 // Behavior:
-// - supports @think=<int> override
-// - supports legacy suffix override (-low/-medium/-high/-xhigh/-max)
-// - unknown/empty model falls back to DefaultModelName
+// - rejects @think override, keep suffix-only think levels
+// - supports suffix override (-low/-medium/-high/-xhigh/-max)
+// - unknown model returns error; explicit pro model rejects
 func Resolve(input string) (Resolved, error) {
 	modelName := strings.TrimSpace(input)
-	thinkOverride := -1
 
-	if idx := strings.LastIndex(modelName, "@think="); idx >= 0 {
-		thinkRaw := strings.TrimSpace(modelName[idx+len("@think="):])
-		if thinkRaw == "" {
-			return Resolved{}, fmt.Errorf("invalid think level: %s", thinkRaw)
-		}
-		value, err := strconv.Atoi(thinkRaw)
-		if err != nil {
-			return Resolved{}, fmt.Errorf("invalid think level: %s", thinkRaw)
-		}
-		thinkOverride = value
-		modelName = strings.TrimSpace(modelName[:idx])
+	if strings.Contains(modelName, "@think=") {
+		return Resolved{}, errLegacyThink
 	}
-
-	_, exactMatch := modelConfigs[modelName]
-	if thinkOverride < 0 && !exactMatch {
-		if base, think, parsed, err := parseThinkSuffix(modelName); err != nil {
-			return Resolved{}, err
-		} else if parsed {
-			modelName = base
-			thinkOverride = think
-		}
-	}
-
 	if modelName == "" {
-		modelName = DefaultModelName
+		return Resolved{}, errUnknown
+	}
+	if modelName == "gemini-3.1-pro" || modelName == "gemini-3.1-pro-enhanced" {
+		return Resolved{}, errProModel
 	}
 
-	cfg, ok := modelConfigs[modelName]
+	if cfg, ok := modelConfigs[modelName]; ok {
+		return Resolved{
+			Name:        modelName,
+			Mode:        cfg.Mode,
+			Think:       cfg.Think,
+			ExtraFields: cloneExtraFields(cfg.ExtraFields),
+		}, nil
+	}
+
+	base, parsedThink, parsed, err := parseThinkSuffix(modelName)
+	if err != nil {
+		return Resolved{}, err
+	}
+	if !parsed {
+		return Resolved{}, errUnknown
+	}
+	if base == "gemini-3.1-pro" || base == "gemini-3.1-pro-enhanced" {
+		return Resolved{}, errProModel
+	}
+
+	cfg, ok := modelConfigs[base]
 	if !ok {
-		modelName = DefaultModelName
-		cfg = modelConfigs[DefaultModelName]
-	}
-
-	think := cfg.Think
-	if thinkOverride >= 0 {
-		think = thinkOverride
+		return Resolved{}, errUnknown
 	}
 
 	return Resolved{
-		Name:        modelName,
+		Name:        base,
 		Mode:        cfg.Mode,
-		Think:       think,
+		Think:       parsedThink,
 		ExtraFields: cloneExtraFields(cfg.ExtraFields),
 	}, nil
 }
@@ -151,8 +143,8 @@ func parseThinkSuffix(modelName string) (base string, think int, parsed bool, er
 	value, ok := suffixThink[suffix]
 	if !ok {
 		baseName := modelName[:idx]
-		if _, exists := modelConfigs[baseName]; exists {
-			return "", 0, false, fmt.Errorf("unsupported think suffix: %s", suffix)
+		if _, exists := modelConfigs[baseName]; exists || baseName == "gemini-3.1-pro" || baseName == "gemini-3.1-pro-enhanced" {
+			return "", 0, false, fmt.Errorf("%w: %s", errUnsupportedThinkSuffix, suffix)
 		}
 		return "", 0, false, nil
 	}
@@ -179,6 +171,10 @@ func PublicModelNames() []string {
 	out := make([]string, 0, len(publicModelOrder))
 	for _, name := range publicModelOrder {
 		if _, ok := modelConfigs[name]; ok {
+			out = append(out, name)
+			continue
+		}
+		if _, _, parsed, err := parseThinkSuffix(name); err == nil && parsed {
 			out = append(out, name)
 		}
 	}

@@ -34,6 +34,27 @@ func TestModelsRoute(t *testing.T) {
 	if len(payload.Models) == 0 {
 		t.Fatalf("expected non-empty models list, got: %+v", payload)
 	}
+	for _, model := range payload.Models {
+		if model.Name == "models/gemini-3.1-pro" || model.Name == "models/gemini-3.1-pro-enhanced" {
+			t.Fatalf("unexpected pro model in public list: %+v", payload.Models)
+		}
+	}
+	wantVariants := []string{
+		"models/gemini-3.5-flash-thinking-low",
+		"models/gemini-3.5-flash-thinking-medium",
+		"models/gemini-3.5-flash-thinking-high",
+		"models/gemini-3.5-flash-thinking-xhigh",
+		"models/gemini-3.5-flash-thinking-max",
+	}
+	index := make(map[string]struct{}, len(payload.Models))
+	for _, model := range payload.Models {
+		index[model.Name] = struct{}{}
+	}
+	for _, variant := range wantVariants {
+		if _, ok := index[variant]; !ok {
+			t.Fatalf("expected variant %s in models list, got: %+v", variant, payload.Models)
+		}
+	}
 }
 
 func TestGenerateContentTextResponse(t *testing.T) {

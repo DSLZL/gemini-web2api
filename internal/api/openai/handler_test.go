@@ -11,7 +11,7 @@ import (
 	"gemini-web2api/internal/api/openai"
 )
 
-func TestModelsContainsProAndEnhanced(t *testing.T) {
+func TestModelsDoesNotContainPro(t *testing.T) {
 	t.Parallel()
 
 	h := openai.NewHandler(nil)
@@ -31,41 +31,31 @@ func TestModelsContainsProAndEnhanced(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
 		t.Fatalf("decode response: %v", err)
 	}
-	var hasPro, hasEnhanced bool
 	for _, item := range body.Data {
-		if item.ID == "gemini-3.1-pro" {
-			hasPro = true
-		}
-		if item.ID == "gemini-3.1-pro-enhanced" {
-			hasEnhanced = true
+		if item.ID == "gemini-3.1-pro" || item.ID == "gemini-3.1-pro-enhanced" {
+			t.Fatalf("unexpected pro model in public list: %s", rec.Body.String())
 		}
 	}
-	if !hasPro || !hasEnhanced {
-		t.Fatalf("expected pro models in list, got: %s", rec.Body.String())
+	wantVariants := []string{
+		"gemini-3.5-flash-thinking-low",
+		"gemini-3.5-flash-thinking-medium",
+		"gemini-3.5-flash-thinking-high",
+		"gemini-3.5-flash-thinking-xhigh",
+		"gemini-3.5-flash-thinking-max",
+	}
+	index := make(map[string]struct{}, len(body.Data))
+	for _, item := range body.Data {
+		index[item.ID] = struct{}{}
+	}
+	for _, variant := range wantVariants {
+		if _, ok := index[variant]; !ok {
+			t.Fatalf("expected variant %s in models list, got: %s", variant, rec.Body.String())
+		}
 	}
 }
 
-func TestChatCompletionsAcceptsThinkOverride(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		inner := make([]any, 5)
-		inner[4] = []any{
-			[]any{nil, []any{"override ok"}},
-		}
-		innerJSON, _ := json.Marshal(inner)
-		line := []any{
-			[]any{"wrb.fr", nil, string(innerJSON)},
-		}
-		lineJSON, _ := json.Marshal(line)
-		_, _ = w.Write([]byte(string(lineJSON) + "\n"))
-	}))
-	defer srv.Close()
-
-	prev := os.Getenv("GEMINI_WEB2API_GEMINI_WEB_BASE")
-	_ = os.Setenv("GEMINI_WEB2API_GEMINI_WEB_BASE", srv.URL)
-	t.Cleanup(func() {
-		_ = os.Setenv("GEMINI_WEB2API_GEMINI_WEB_BASE", prev)
-	})
-
+func TestChatCompletionsRejectsLegacyThink(t *testing.T) {
+	t.Parallel()
 	h := openai.NewHandler(nil)
 	req := httptest.NewRequest(
 		http.MethodPost,
@@ -75,15 +65,15 @@ func TestChatCompletionsAcceptsThinkOverride(t *testing.T) {
 	rec := httptest.NewRecorder()
 
 	h.ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("unexpected status: got %d want %d, body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("unexpected status: got %d want %d", rec.Code, http.StatusBadRequest)
 	}
-	if !strings.Contains(rec.Body.String(), "override ok") {
-		t.Fatalf("expected upstream text, got: %s", rec.Body.String())
+	if !strings.Contains(rec.Body.String(), "@think") {
+		t.Fatalf("expected legacy think rejection message, got: %s", rec.Body.String())
 	}
 }
 
-func TestChatCompletionsUnknownModelFallsBack(t *testing.T) {
+func TestChatCompletionsUnknownModelRejected(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		inner := make([]any, 5)
 		inner[4] = []any{
@@ -113,11 +103,11 @@ func TestChatCompletionsUnknownModelFallsBack(t *testing.T) {
 	rec := httptest.NewRecorder()
 
 	h.ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("unexpected status: got %d want %d, body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("unexpected status: got %d want %d, body=%s", rec.Code, http.StatusBadRequest, rec.Body.String())
 	}
-	if !strings.Contains(rec.Body.String(), `"model":"gemini-3.5-flash"`) {
-		t.Fatalf("expected fallback model in response, got: %s", rec.Body.String())
+	if !strings.Contains(rec.Body.String(), "unknown model") {
+		t.Fatalf("expected unknown model error, got: %s", rec.Body.String())
 	}
 }
 
