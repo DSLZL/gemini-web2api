@@ -40,7 +40,7 @@ func TestGenerate_UsesContextCancellation(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		_, err := client.Generate(ctx, "hello", 1, 4)
+		_, err := client.Generate(ctx, "hello", 1, 4, nil)
 		done <- err
 	}()
 
@@ -99,7 +99,7 @@ func TestGenerate_ParsesStreamGenerateLikePayload(t *testing.T) {
 		Client:    srv.Client(),
 		ProxyBase: srv.URL,
 	})
-	got, err := client.Generate(context.Background(), "hello", 1, 4)
+	got, err := client.Generate(context.Background(), "hello", 1, 4, nil)
 	if err != nil {
 		t.Fatalf("generate error: %v", err)
 	}
@@ -159,7 +159,7 @@ func TestGenerate_PoolFallsBackOnEmptyResponse(t *testing.T) {
 		},
 	})
 
-	got, err := client.Generate(context.Background(), "hello", 1, 4)
+	got, err := client.Generate(context.Background(), "hello", 1, 4, nil)
 	if err != nil {
 		t.Fatalf("generate error: %v", err)
 	}
@@ -174,5 +174,70 @@ func TestParseStreamText_EmptyResponseError(t *testing.T) {
 	_, err := parseStreamText(`[[\"wrb.fr\",null,null]]`)
 	if !errors.Is(err, ErrEmptyResponse) {
 		t.Fatalf("expected ErrEmptyResponse, got: %v", err)
+	}
+}
+
+func TestGenerate_AppliesExtraFieldsToPayload(t *testing.T) {
+	t.Parallel()
+
+	var capturedInner []any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseForm(); err != nil {
+			t.Fatalf("parse form: %v", err)
+		}
+		freq := r.Form.Get("f.req")
+		if freq == "" {
+			t.Fatal("expected f.req")
+		}
+		var outer []any
+		if err := json.Unmarshal([]byte(freq), &outer); err != nil {
+			t.Fatalf("decode outer f.req: %v", err)
+		}
+		if len(outer) < 2 {
+			t.Fatalf("unexpected outer payload shape: %#v", outer)
+		}
+		innerRaw, _ := outer[1].(string)
+		if innerRaw == "" {
+			t.Fatalf("inner payload missing: %#v", outer)
+		}
+		if err := json.Unmarshal([]byte(innerRaw), &capturedInner); err != nil {
+			t.Fatalf("decode inner payload: %v", err)
+		}
+
+		inner := make([]any, 5)
+		inner[4] = []any{
+			[]any{nil, []any{"ok"}},
+		}
+		innerJSON, _ := json.Marshal(inner)
+		line := []any{
+			[]any{"wrb.fr", nil, string(innerJSON)},
+		}
+		lineJSON, _ := json.Marshal(line)
+		_, _ = w.Write([]byte(string(lineJSON) + "\n"))
+	}))
+	defer srv.Close()
+
+	client := NewClient(Config{
+		Client:    srv.Client(),
+		ProxyBase: srv.URL,
+	})
+	_, err := client.Generate(context.Background(), "hello", 3, 4, &GenerateOptions{
+		ExtraFields: map[int]any{
+			31: 2,
+			80: 3,
+		},
+	})
+	if err != nil {
+		t.Fatalf("generate error: %v", err)
+	}
+
+	if len(capturedInner) <= 80 {
+		t.Fatalf("inner payload too short: %d", len(capturedInner))
+	}
+	if got := capturedInner[31]; got != float64(2) {
+		t.Fatalf("unexpected extra field 31: %#v", got)
+	}
+	if got := capturedInner[80]; got != float64(3) {
+		t.Fatalf("unexpected extra field 80: %#v", got)
 	}
 }

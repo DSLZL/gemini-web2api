@@ -18,14 +18,25 @@ type Handler struct {
 }
 
 type chatMessage struct {
-	Role    string `json:"role"`
-	Content any    `json:"content"`
+	Role     string           `json:"role"`
+	Content  any              `json:"content"`
+	Name     string           `json:"name,omitempty"`
+	ToolCalls []parsedToolCall `json:"tool_calls,omitempty"`
 }
 
 type chatRequest struct {
-	Model    string        `json:"model"`
-	Messages []chatMessage `json:"messages"`
-	Stream   bool          `json:"stream"`
+	Model      string       `json:"model"`
+	Messages   []chatMessage `json:"messages"`
+	Stream     bool         `json:"stream"`
+	Tools      []toolSpec   `json:"tools"`
+	ToolChoice any          `json:"tool_choice"`
+}
+
+type responseInputFunctionCallOutput struct {
+	Type   string `json:"type"`
+	CallID string `json:"call_id"`
+	Name   string `json:"name"`
+	Output string `json:"output"`
 }
 
 // NewHandler creates the OpenAI-compatible endpoint handler.
@@ -60,7 +71,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case r.Method == http.MethodPost && r.URL.Path == "/v1/chat/completions":
 		h.handleChatCompletions(w, r)
 	case r.Method == http.MethodPost && r.URL.Path == "/v1/responses":
-		h.handleResponses(w)
+		h.handleResponses(w, r)
 	default:
 		http.NotFound(w, r)
 	}
@@ -87,29 +98,55 @@ func (h *Handler) handleChatCompletions(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	if req.Model == "" {
-		req.Model = "gemini-3.5-flash"
+	if strings.TrimSpace(req.Model) == "" {
+		req.Model = models.DefaultModelName
 	}
-	mode, think, err := models.Resolve(req.Model)
+
+	resolved, err := models.Resolve(req.Model)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
-	prompt := messagesToPrompt(req.Messages)
+	prompt := messagesToPrompt(req.Messages, req.Tools, req.ToolChoice)
 	if strings.TrimSpace(prompt) == "" {
 		writeError(w, http.StatusBadRequest, "empty prompt")
 		return
 	}
 
-	text, err := h.upstream.Generate(r.Context(), prompt, mode, think)
+	text, err := h.upstream.Generate(r.Context(), prompt, resolved.Mode, resolved.Think, &gemini.GenerateOptions{
+		ExtraFields: resolved.ExtraFields,
+	})
 	if err != nil {
 		writeError(w, http.StatusBadGateway, "upstream error: "+err.Error())
 		return
 	}
 
+	cleanText := text
+	var toolCalls []parsedToolCall
+	if len(req.Tools) > 0 && !isToolChoiceNone(req.ToolChoice) {
+		cleanText, toolCalls = parseToolCalls(text)
+	}
+
+	finishReason := "stop"
+	message := map[string]any{
+		"role":    "assistant",
+		"content": cleanText,
+	}
+	if len(toolCalls) > 0 {
+		finishReason = "tool_calls"
+		message["tool_calls"] = toolCalls
+		if strings.TrimSpace(cleanText) == "" {
+			message["content"] = nil
+		}
+	}
+
+	if req.Stream && (len(req.Tools) == 0 || isToolChoiceNone(req.ToolChoice)) {
+		h.writeChatStream(w, resolved.Name, cleanText)
+		return
+	}
 	if req.Stream {
-		h.writeChatStream(w, req.Model, text)
+		h.writeChatToolAwareStream(w, resolved.Name, message, finishReason)
 		return
 	}
 
@@ -118,32 +155,337 @@ func (h *Handler) handleChatCompletions(w http.ResponseWriter, r *http.Request) 
 		"id":      "chatcmpl_go",
 		"object":  "chat.completion",
 		"created": now,
-		"model":   req.Model,
+		"model":   resolved.Name,
 		"choices": []map[string]any{
 			{
-				"index": 0,
-				"message": map[string]any{
-					"role":    "assistant",
-					"content": text,
-				},
-				"finish_reason": "stop",
+				"index":         0,
+				"message":       message,
+				"finish_reason": finishReason,
 			},
 		},
 		"usage": map[string]any{
 			"prompt_tokens":     len(prompt) / 4,
-			"completion_tokens": len(text) / 4,
-			"total_tokens":      (len(prompt) + len(text)) / 4,
+			"completion_tokens": len(cleanText) / 4,
+			"total_tokens":      (len(prompt) + len(cleanText)) / 4,
 		},
 	})
 }
 
-func (h *Handler) handleResponses(w http.ResponseWriter) {
-	writeJSON(w, http.StatusOK, map[string]any{
-		"id":     "resp_placeholder",
-		"object": "response",
-		"status": "completed",
-		"output": []any{},
+func (h *Handler) handleResponses(w http.ResponseWriter, r *http.Request) {
+	var req map[string]any
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	modelName, _ := req["model"].(string)
+	if strings.TrimSpace(modelName) == "" {
+		modelName = models.DefaultModelName
+	}
+	resolved, err := models.Resolve(modelName)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	messages := buildResponsesMessages(req)
+	tools := normalizeResponsesTools(req["tools"])
+	toolChoiceValue, hasToolChoice := req["tool_choice"]
+	if !hasToolChoice {
+		toolChoiceValue = "auto"
+	}
+
+	prompt := messagesToPrompt(messages, tools, toolChoiceValue)
+	if strings.TrimSpace(prompt) == "" {
+		writeError(w, http.StatusBadRequest, "empty input")
+		return
+	}
+
+	text, err := h.upstream.Generate(r.Context(), prompt, resolved.Mode, resolved.Think, &gemini.GenerateOptions{
+		ExtraFields: resolved.ExtraFields,
 	})
+	if err != nil {
+		writeError(w, http.StatusBadGateway, "upstream error: "+err.Error())
+		return
+	}
+
+	cleanText := text
+	var toolCalls []parsedToolCall
+	if len(tools) > 0 && !isToolChoiceNone(toolChoiceValue) {
+		cleanText, toolCalls = parseToolCalls(text)
+	}
+
+	rid := "resp_go"
+	mid := "msg_go"
+	output := make([]map[string]any, 0, len(toolCalls)+1)
+
+	for _, tc := range toolCalls {
+		output = append(output, map[string]any{
+			"type":      "function_call",
+			"id":        tc.ID,
+			"call_id":   tc.ID,
+			"name":      tc.Function.Name,
+			"arguments": tc.Function.Arguments,
+			"status":    "completed",
+		})
+	}
+
+	if strings.TrimSpace(cleanText) != "" || len(toolCalls) == 0 {
+		output = append(output, map[string]any{
+			"type":   "message",
+			"id":     mid,
+			"role":   "assistant",
+			"status": "completed",
+			"content": []map[string]any{
+				{
+					"type":        "output_text",
+					"text":        cleanText,
+					"annotations": []any{},
+				},
+			},
+		})
+	}
+
+	stream, _ := req["stream"].(bool)
+	if stream {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.WriteHeader(http.StatusOK)
+
+		created := map[string]any{
+			"type": "response.created",
+			"response": map[string]any{
+				"id":     rid,
+				"object": "response",
+				"status": "in_progress",
+				"model":  resolved.Name,
+				"output": []any{},
+			},
+		}
+		writeSSEEvent(w, "response.created", created)
+		for _, item := range output {
+			itemType, _ := item["type"].(string)
+			switch itemType {
+			case "function_call":
+				writeSSEEvent(w, "response.function_call_arguments.done", map[string]any{
+					"type":     "response.function_call_arguments.done",
+					"item_id":  item["id"],
+					"call_id":  item["call_id"],
+					"name":     item["name"],
+					"arguments": item["arguments"],
+				})
+			case "message":
+				content, _ := item["content"].([]map[string]any)
+				for idx, part := range content {
+					writeSSEEvent(w, "response.output_text.done", map[string]any{
+						"type":          "response.output_text.done",
+						"item_id":       item["id"],
+						"content_index": idx,
+						"text":          part["text"],
+					})
+				}
+			}
+		}
+
+		completed := map[string]any{
+			"type": "response.completed",
+			"response": map[string]any{
+				"id":     rid,
+				"object": "response",
+				"status": "completed",
+				"model":  resolved.Name,
+				"output": output,
+				"usage": map[string]any{
+					"input_tokens":  len(prompt) / 4,
+					"output_tokens": len(cleanText) / 4,
+					"total_tokens":  (len(prompt) + len(cleanText)) / 4,
+				},
+			},
+		}
+		writeSSEEvent(w, "response.completed", completed)
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"id":        rid,
+		"object":    "response",
+		"created_at": time.Now().Unix(),
+		"status":    "completed",
+		"model":     resolved.Name,
+		"output":    output,
+		"usage": map[string]any{
+			"input_tokens":  len(prompt) / 4,
+			"output_tokens": len(cleanText) / 4,
+			"total_tokens":  (len(prompt) + len(cleanText)) / 4,
+		},
+	})
+}
+
+func buildResponsesMessages(req map[string]any) []chatMessage {
+	messages := make([]chatMessage, 0, 8)
+	if instructions, _ := req["instructions"].(string); strings.TrimSpace(instructions) != "" {
+		messages = append(messages, chatMessage{Role: "system", Content: instructions})
+	}
+
+	input := req["input"]
+	switch v := input.(type) {
+	case string:
+		if strings.TrimSpace(v) != "" {
+			messages = append(messages, chatMessage{Role: "user", Content: v})
+		}
+	case []any:
+		for _, item := range v {
+			switch it := item.(type) {
+			case string:
+				if strings.TrimSpace(it) != "" {
+					messages = append(messages, chatMessage{Role: "user", Content: it})
+				}
+			case map[string]any:
+				itemType, _ := it["type"].(string)
+				role, _ := it["role"].(string)
+				if itemType == "function_call_output" {
+					call := responseInputFunctionCallOutput{}
+					call.Type, _ = it["type"].(string)
+					call.CallID, _ = it["call_id"].(string)
+					call.Name, _ = it["name"].(string)
+					call.Output, _ = it["output"].(string)
+					messages = append(messages, chatMessage{Role: "tool", Name: call.Name, Content: call.Output})
+					continue
+				}
+				if role == "assistant" || (itemType == "message" && role == "assistant") {
+					content := it["content"]
+					text, toolCalls := parseAssistantContent(content)
+					msg := chatMessage{
+						Role:    "assistant",
+						Content: text,
+					}
+					if len(toolCalls) > 0 {
+						msg.ToolCalls = toolCalls
+					}
+					messages = append(messages, msg)
+					continue
+				}
+
+				content := it["content"]
+				messages = append(messages, chatMessage{
+					Role:    defaultString(role, "user"),
+					Content: content,
+				})
+			}
+		}
+	}
+	return messages
+}
+
+func parseAssistantContent(content any) (string, []parsedToolCall) {
+	switch v := content.(type) {
+	case string:
+		return v, nil
+	case []any:
+		textParts := make([]string, 0, len(v))
+		calls := make([]parsedToolCall, 0, 2)
+		for i, item := range v {
+			obj, ok := item.(map[string]any)
+			if !ok {
+				continue
+			}
+			t, _ := obj["type"].(string)
+			switch t {
+			case "output_text":
+				if txt, _ := obj["text"].(string); strings.TrimSpace(txt) != "" {
+					textParts = append(textParts, txt)
+				}
+			case "function_call":
+				name, _ := obj["name"].(string)
+				arguments, _ := obj["arguments"].(string)
+				callID, _ := obj["call_id"].(string)
+				if strings.TrimSpace(callID) == "" {
+					callID = "call_" + strconv.Itoa(i)
+				}
+				if strings.TrimSpace(name) == "" {
+					continue
+				}
+				if strings.TrimSpace(arguments) == "" {
+					arguments = "{}"
+				}
+				call := parsedToolCall{
+					ID:   callID,
+					Type: "function",
+				}
+				call.Function.Name = name
+				call.Function.Arguments = arguments
+				calls = append(calls, call)
+			}
+		}
+		return strings.Join(textParts, " "), calls
+	default:
+		return "", nil
+	}
+}
+
+func normalizeResponsesTools(raw any) []toolSpec {
+	items, ok := raw.([]any)
+	if !ok {
+		return nil
+	}
+	out := make([]toolSpec, 0, len(items))
+	for _, item := range items {
+		obj, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+
+		toolType := defaultString(asString(obj["type"]), "function")
+		if strings.EqualFold(toolType, "function") {
+			_, hasNested := obj["function"].(map[string]any)
+			if !hasNested {
+				spec := toolSpec{
+					Type: "function",
+					Function: &toolSpecDetail{
+						Name:        strings.TrimSpace(asString(obj["name"])),
+						Description: asString(obj["description"]),
+					},
+				}
+				if params, ok := obj["parameters"].(map[string]any); ok {
+					spec.Function.Parameters = params
+				} else {
+					spec.Function.Parameters = map[string]any{}
+				}
+				out = append(out, spec)
+				continue
+			}
+		}
+
+		spec := toolSpec{Type: toolType}
+		if fnObj, ok := obj["function"].(map[string]any); ok {
+			spec.Function = &toolSpecDetail{
+				Name:        strings.TrimSpace(asString(fnObj["name"])),
+				Description: asString(fnObj["description"]),
+			}
+			if params, ok := fnObj["parameters"].(map[string]any); ok {
+				spec.Function.Parameters = params
+			} else {
+				spec.Function.Parameters = map[string]any{}
+			}
+		} else {
+			spec.Function = &toolSpecDetail{
+				Name:        strings.TrimSpace(asString(obj["name"])),
+				Description: asString(obj["description"]),
+				Parameters:  map[string]any{},
+			}
+		}
+		out = append(out, spec)
+	}
+	return out
+}
+
+func writeSSEEvent(w http.ResponseWriter, event string, payload any) {
+	raw, _ := json.Marshal(payload)
+	_, _ = w.Write([]byte("event: " + event + "\n"))
+	_, _ = w.Write([]byte("data: " + string(raw) + "\n\n"))
 }
 
 func (h *Handler) writeChatStream(w http.ResponseWriter, model string, text string) {
@@ -176,58 +518,30 @@ func (h *Handler) writeChatStream(w http.ResponseWriter, model string, text stri
 	}
 }
 
-func messagesToPrompt(messages []chatMessage) string {
-	parts := make([]string, 0, len(messages))
-	for _, msg := range messages {
-		content := contentToText(msg.Content)
-		switch msg.Role {
-		case "system":
-			if content != "" {
-				parts = append(parts, "[System instruction]: "+content)
-			}
-		case "assistant":
-			if content != "" {
-				parts = append(parts, "[Assistant]: "+content)
-			}
-		case "tool":
-			if content != "" {
-				parts = append(parts, "[Tool result]: "+content)
-			}
-		default:
-			if content != "" {
-				parts = append(parts, content)
-			}
-		}
-	}
-	return strings.Join(parts, "\n\n")
-}
+func (h *Handler) writeChatToolAwareStream(w http.ResponseWriter, model string, message map[string]any, finishReason string) {
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.WriteHeader(http.StatusOK)
 
-func contentToText(content any) string {
-	switch v := content.(type) {
-	case string:
-		return strings.TrimSpace(v)
-	case []any:
-		var parts []string
-		for _, item := range v {
-			obj, ok := item.(map[string]any)
-			if !ok {
-				continue
-			}
-			t, _ := obj["type"].(string)
-			if t != "text" && t != "input_text" {
-				continue
-			}
-			txt, _ := obj["text"].(string)
-			if strings.TrimSpace(txt) != "" {
-				parts = append(parts, txt)
-			}
-		}
-		return strings.Join(parts, " ")
-	case map[string]any:
-		txt, _ := v["text"].(string)
-		return strings.TrimSpace(txt)
-	default:
-		return ""
+	chunk := map[string]any{
+		"id":      "chatcmpl_go",
+		"object":  "chat.completion.chunk",
+		"created": time.Now().Unix(),
+		"model":   model,
+		"choices": []map[string]any{
+			{
+				"index":         0,
+				"delta":         message,
+				"finish_reason": finishReason,
+			},
+		},
+	}
+	raw, _ := json.Marshal(chunk)
+	_, _ = w.Write([]byte("data: " + string(raw) + "\n\n"))
+	_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	if f, ok := w.(http.Flusher); ok {
+		f.Flush()
 	}
 }
 
@@ -244,6 +558,13 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)
+}
+
+func defaultString(value string, fallback string) string {
+	if strings.TrimSpace(value) == "" {
+		return fallback
+	}
+	return value
 }
 
 func parseProxyBases(rawList, fallback string) []string {

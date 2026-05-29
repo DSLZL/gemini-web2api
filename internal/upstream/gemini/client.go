@@ -49,6 +49,11 @@ type Client struct {
 	auth      bool
 }
 
+// GenerateOptions controls optional upstream payload extensions.
+type GenerateOptions struct {
+	ExtraFields map[int]any
+}
+
 // NewClient creates a StreamGenerate client.
 func NewClient(cfg Config) *Client {
 	httpClient := cfg.Client
@@ -78,9 +83,9 @@ func NewClient(cfg Config) *Client {
 }
 
 // Generate sends a StreamGenerate request and extracts final text.
-func (c *Client) Generate(ctx context.Context, prompt string, mode, think int) (string, error) {
+func (c *Client) Generate(ctx context.Context, prompt string, mode, think int, opts *GenerateOptions) (string, error) {
 	if c.pool == nil {
-		raw, err := c.streamGenerate(ctx, prompt, mode, think, c.proxyBase)
+		raw, err := c.streamGenerate(ctx, prompt, mode, think, c.proxyBase, opts)
 		if err != nil {
 			return "", err
 		}
@@ -109,7 +114,7 @@ func (c *Client) Generate(ctx context.Context, prompt string, mode, think int) (
 
 	var errs []error
 	for _, base := range candidates {
-		raw, err := c.streamGenerate(ctx, prompt, mode, think, base)
+		raw, err := c.streamGenerate(ctx, prompt, mode, think, base, opts)
 		if err != nil {
 			c.pool.RecordFailure(base, time.Now())
 			errs = append(errs, fmt.Errorf("%s: %w", base, err))
@@ -130,7 +135,7 @@ func (c *Client) Generate(ctx context.Context, prompt string, mode, think int) (
 	return "", errors.Join(errs...)
 }
 
-func (c *Client) streamGenerate(ctx context.Context, prompt string, mode, think int, base string) (string, error) {
+func (c *Client) streamGenerate(ctx context.Context, prompt string, mode, think int, base string, opts *GenerateOptions) (string, error) {
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
@@ -138,7 +143,7 @@ func (c *Client) streamGenerate(ctx context.Context, prompt string, mode, think 
 		return "", errors.New("empty prompt")
 	}
 
-	inner := make([]any, 80)
+	inner := make([]any, 102)
 	inner[0] = []any{prompt, 0, nil, nil, nil, nil, 0}
 	inner[1] = []any{"en"}
 	inner[2] = []any{"", "", "", nil, nil, nil, nil, nil, nil, ""}
@@ -156,6 +161,19 @@ func (c *Client) streamGenerate(ctx context.Context, prompt string, mode, think 
 	inner[61] = []any{}
 	inner[68] = 1
 	inner[79] = mode
+	if opts != nil {
+		for key, value := range opts.ExtraFields {
+			if key < 0 {
+				continue
+			}
+			if key >= len(inner) {
+				extended := make([]any, key+1)
+				copy(extended, inner)
+				inner = extended
+			}
+			inner[key] = value
+		}
+	}
 
 	innerJSON, err := json.Marshal(inner)
 	if err != nil {
@@ -304,4 +322,3 @@ func uuidString() string {
 		uint64(now)&0xFFFFFFFFFFFF,
 	)
 }
-

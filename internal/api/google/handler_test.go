@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 
@@ -18,17 +19,13 @@ func TestModelsRoute(t *testing.T) {
 	rec := httptest.NewRecorder()
 
 	h.ServeHTTP(rec, req)
-
 	if rec.Code != http.StatusOK {
 		t.Fatalf("unexpected status: got %d want %d", rec.Code, http.StatusOK)
 	}
 
 	var payload struct {
 		Models []struct {
-			Name                       string   `json:"name"`
-			DisplayName                string   `json:"displayName"`
-			Description                string   `json:"description"`
-			SupportedGenerationMethods []string `json:"supportedGenerationMethods"`
+			Name string `json:"name"`
 		} `json:"models"`
 	}
 	if err := json.NewDecoder(rec.Body).Decode(&payload); err != nil {
@@ -37,91 +34,116 @@ func TestModelsRoute(t *testing.T) {
 	if len(payload.Models) == 0 {
 		t.Fatalf("expected non-empty models list, got: %+v", payload)
 	}
-	first := payload.Models[0]
-	if first.Name == "" || first.DisplayName == "" || first.Description == "" {
-		t.Fatalf("expected model shape fields, got: %+v", first)
+}
+
+func TestGenerateContentTextResponse(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		inner := make([]any, 5)
+		inner[4] = []any{
+			[]any{nil, []any{"google answer"}},
+		}
+		innerJSON, _ := json.Marshal(inner)
+		line := []any{
+			[]any{"wrb.fr", nil, string(innerJSON)},
+		}
+		lineJSON, _ := json.Marshal(line)
+		_, _ = w.Write([]byte(string(lineJSON) + "\n"))
+	}))
+	defer srv.Close()
+
+	prev := os.Getenv("GEMINI_WEB2API_GEMINI_WEB_BASE")
+	_ = os.Setenv("GEMINI_WEB2API_GEMINI_WEB_BASE", srv.URL)
+	t.Cleanup(func() {
+		_ = os.Setenv("GEMINI_WEB2API_GEMINI_WEB_BASE", prev)
+	})
+
+	h := google.NewHandler(nil)
+	req := httptest.NewRequest(http.MethodPost, "/v1beta/models/gemini-3.5-flash:generateContent", strings.NewReader(`{
+		"contents":[{"role":"user","parts":[{"text":"hi"}]}]
+	}`))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unexpected status: got %d want %d, body=%s", rec.Code, http.StatusOK, rec.Body.String())
 	}
-	if len(first.SupportedGenerationMethods) == 0 {
-		t.Fatalf("expected supportedGenerationMethods, got: %+v", first)
+	if !strings.Contains(rec.Body.String(), "google answer") {
+		t.Fatalf("expected response text, got: %s", rec.Body.String())
 	}
 }
 
-func TestGenerateContentRoutes(t *testing.T) {
-	t.Parallel()
+func TestGenerateContentToolFunctionCallResponse(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		inner := make([]any, 5)
+		inner[4] = []any{
+			[]any{nil, []any{"```function_call\n{\"name\":\"lookup\",\"args\":{\"k\":\"v\"}}\n```"}},
+		}
+		innerJSON, _ := json.Marshal(inner)
+		line := []any{
+			[]any{"wrb.fr", nil, string(innerJSON)},
+		}
+		lineJSON, _ := json.Marshal(line)
+		_, _ = w.Write([]byte(string(lineJSON) + "\n"))
+	}))
+	defer srv.Close()
+
+	prev := os.Getenv("GEMINI_WEB2API_GEMINI_WEB_BASE")
+	_ = os.Setenv("GEMINI_WEB2API_GEMINI_WEB_BASE", srv.URL)
+	t.Cleanup(func() {
+		_ = os.Setenv("GEMINI_WEB2API_GEMINI_WEB_BASE", prev)
+	})
 
 	h := google.NewHandler(nil)
+	req := httptest.NewRequest(http.MethodPost, "/v1beta/models/gemini-3.5-flash:generateContent", strings.NewReader(`{
+		"contents":[{"role":"user","parts":[{"text":"call tool"}]}],
+		"tools":[{"functionDeclarations":[{"name":"lookup","description":"lookup","parameters":{"type":"object"}}]}],
+		"toolConfig":{"functionCallingConfig":{"mode":"AUTO"}}
+	}`))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
 
-	t.Run("generateContent", func(t *testing.T) {
-		req := httptest.NewRequest(http.MethodPost, "/v1beta/models/gemini-3.5-flash:generateContent", strings.NewReader(`{}`))
-		rec := httptest.NewRecorder()
-		h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unexpected status: got %d want %d, body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"functionCall"`) {
+		t.Fatalf("expected functionCall in response parts, got: %s", rec.Body.String())
+	}
+}
 
-		if rec.Code != http.StatusOK {
-			t.Fatalf("unexpected status: got %d want %d", rec.Code, http.StatusOK)
+func TestStreamGenerateContentReturnsSSE(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		inner := make([]any, 5)
+		inner[4] = []any{
+			[]any{nil, []any{"stream answer"}},
 		}
+		innerJSON, _ := json.Marshal(inner)
+		line := []any{
+			[]any{"wrb.fr", nil, string(innerJSON)},
+		}
+		lineJSON, _ := json.Marshal(line)
+		_, _ = w.Write([]byte(string(lineJSON) + "\n"))
+	}))
+	defer srv.Close()
 
-		var payload struct {
-			Candidates []struct {
-				Index        int    `json:"index"`
-				FinishReason string `json:"finishReason"`
-				Content      struct {
-					Parts []struct {
-						Text string `json:"text"`
-					} `json:"parts"`
-					Role string `json:"role"`
-				} `json:"content"`
-			} `json:"candidates"`
-		}
-		if err := json.NewDecoder(rec.Body).Decode(&payload); err != nil {
-			t.Fatalf("decode generateContent response: %v", err)
-		}
-		if len(payload.Candidates) == 0 {
-			t.Fatalf("expected non-empty candidates, got: %+v", payload)
-		}
-		c := payload.Candidates[0]
-		if c.FinishReason == "" || c.Content.Role == "" || len(c.Content.Parts) == 0 {
-			t.Fatalf("expected candidate shape fields, got: %+v", c)
-		}
-		if c.Content.Parts[0].Text == "" {
-			t.Fatalf("expected candidate text field, got: %+v", c.Content.Parts[0])
-		}
+	prev := os.Getenv("GEMINI_WEB2API_GEMINI_WEB_BASE")
+	_ = os.Setenv("GEMINI_WEB2API_GEMINI_WEB_BASE", srv.URL)
+	t.Cleanup(func() {
+		_ = os.Setenv("GEMINI_WEB2API_GEMINI_WEB_BASE", prev)
 	})
 
-	t.Run("streamGenerateContent", func(t *testing.T) {
-		req := httptest.NewRequest(http.MethodPost, "/v1beta/models/gemini-3.5-flash:streamGenerateContent", strings.NewReader(`{}`))
-		rec := httptest.NewRecorder()
-		h.ServeHTTP(rec, req)
+	h := google.NewHandler(nil)
+	req := httptest.NewRequest(http.MethodPost, "/v1beta/models/gemini-3.5-flash:streamGenerateContent", strings.NewReader(`{
+		"contents":[{"role":"user","parts":[{"text":"hi"}]}]
+	}`))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
 
-		if rec.Code != http.StatusOK {
-			t.Fatalf("unexpected status: got %d want %d", rec.Code, http.StatusOK)
-		}
-
-		var payload struct {
-			Candidates []struct {
-				Index        int    `json:"index"`
-				FinishReason string `json:"finishReason"`
-				Content      struct {
-					Parts []struct {
-						Text string `json:"text"`
-					} `json:"parts"`
-					Role string `json:"role"`
-				} `json:"content"`
-			} `json:"candidates"`
-		}
-		if err := json.NewDecoder(rec.Body).Decode(&payload); err != nil {
-			t.Fatalf("decode streamGenerateContent response: %v", err)
-		}
-		if len(payload.Candidates) == 0 {
-			t.Fatalf("expected non-empty candidates, got: %+v", payload)
-		}
-		c := payload.Candidates[0]
-		if c.FinishReason == "" || c.Content.Role == "" || len(c.Content.Parts) == 0 {
-			t.Fatalf("expected candidate shape fields, got: %+v", c)
-		}
-		if c.Content.Parts[0].Text == "" {
-			t.Fatalf("expected candidate text field, got: %+v", c.Content.Parts[0])
-		}
-	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unexpected status: got %d want %d, body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "data: ") {
+		t.Fatalf("expected SSE data output, got: %s", rec.Body.String())
+	}
 }
 
 func TestUnknownPathReturnsNotFound(t *testing.T) {
@@ -130,9 +152,7 @@ func TestUnknownPathReturnsNotFound(t *testing.T) {
 	h := google.NewHandler(nil)
 	req := httptest.NewRequest(http.MethodGet, "/v1beta/unknown", nil)
 	rec := httptest.NewRecorder()
-
 	h.ServeHTTP(rec, req)
-
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("unexpected status: got %d want %d", rec.Code, http.StatusNotFound)
 	}

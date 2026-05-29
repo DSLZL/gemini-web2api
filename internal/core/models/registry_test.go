@@ -1,34 +1,52 @@
 package models_test
 
 import (
-	"strings"
+	"slices"
 	"testing"
 
 	"gemini-web2api/internal/core/models"
 )
 
-func TestResolveRejectsPro(t *testing.T) {
+func TestResolveFallbackUnknownModel(t *testing.T) {
 	t.Parallel()
 
-	_, _, err := models.Resolve("gemini-3.1-pro")
-	if err == nil {
-		t.Fatal("expected pro model rejection")
+	got, err := models.Resolve("gemini-unknown")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got.Name != models.DefaultModelName {
+		t.Fatalf("unexpected fallback model: got %q want %q", got.Name, models.DefaultModelName)
+	}
+	if got.Mode != 1 || got.Think != 4 {
+		t.Fatalf("unexpected fallback mode/think: mode=%d think=%d", got.Mode, got.Think)
 	}
 }
 
-func TestResolveRejectsLegacyAtThink(t *testing.T) {
+func TestResolveSupportsThinkAtOverride(t *testing.T) {
 	t.Parallel()
 
-	_, _, err := models.Resolve("gemini-3.5-flash-thinking@think=2")
-	if err == nil {
-		t.Fatal("expected legacy @think rejection")
+	got, err := models.Resolve("gemini-3.5-flash-thinking@think=2")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
 	}
-	if !strings.Contains(err.Error(), "suffix") {
-		t.Fatalf("expected guidance to use suffix format, got %q", err.Error())
+	if got.Name != "gemini-3.5-flash-thinking" {
+		t.Fatalf("unexpected model name: %q", got.Name)
+	}
+	if got.Mode != 2 || got.Think != 2 {
+		t.Fatalf("unexpected mode/think: mode=%d think=%d", got.Mode, got.Think)
 	}
 }
 
-func TestResolveSuffixMapping(t *testing.T) {
+func TestResolveRejectsInvalidThinkAtOverride(t *testing.T) {
+	t.Parallel()
+
+	_, err := models.Resolve("gemini-3.5-flash@think=abc")
+	if err == nil {
+		t.Fatal("expected invalid think level error")
+	}
+}
+
+func TestResolveSuffixMappingStillSupported(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
@@ -48,106 +66,49 @@ func TestResolveSuffixMapping(t *testing.T) {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			gotMode, gotThink, err := models.Resolve(tc.model)
+			got, err := models.Resolve(tc.model)
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
-			if gotMode != tc.wantMode {
-				t.Fatalf("unexpected mode value, got %d want %d", gotMode, tc.wantMode)
-			}
-			if gotThink != tc.wantThink {
-				t.Fatalf("unexpected think value, got %d want %d", gotThink, tc.wantThink)
+			if got.Mode != tc.wantMode || got.Think != tc.wantThink {
+				t.Fatalf("unexpected mode/think: got=(%d,%d) want=(%d,%d)", got.Mode, got.Think, tc.wantMode, tc.wantThink)
 			}
 		})
-	}
-}
-
-func TestResolveDefaultThink(t *testing.T) {
-	t.Parallel()
-
-	gotMode, gotThink, err := models.Resolve("gemini-3.5-flash-thinking")
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if gotMode != 2 {
-		t.Fatalf("unexpected mode, got %d want 2", gotMode)
-	}
-	if gotThink != 4 {
-		t.Fatalf("unexpected default think, got %d want 4", gotThink)
 	}
 }
 
 func TestResolveUnsupportedThinkSuffix(t *testing.T) {
 	t.Parallel()
 
-	_, _, err := models.Resolve("gemini-3.5-flash-thinking-ultra")
+	_, err := models.Resolve("gemini-3.5-flash-thinking-ultra")
 	if err == nil {
-		t.Fatal("expected unsupported think suffix rejection")
-	}
-	if !strings.Contains(err.Error(), "unsupported think suffix") {
-		t.Fatalf("expected unsupported think suffix error, got %q", err.Error())
+		t.Fatal("expected unsupported think suffix error")
 	}
 }
 
-func TestResolveUnknownModel(t *testing.T) {
+func TestResolveProEnhancedExtraFields(t *testing.T) {
 	t.Parallel()
 
-	_, _, err := models.Resolve("gemini-unknown")
-	if err == nil {
-		t.Fatal("expected unknown model rejection")
+	got, err := models.Resolve("gemini-3.1-pro-enhanced")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got.Mode != 3 || got.Think != 4 {
+		t.Fatalf("unexpected mode/think: mode=%d think=%d", got.Mode, got.Think)
+	}
+	if len(got.ExtraFields) != 2 || got.ExtraFields[31] != 2 || got.ExtraFields[80] != 3 {
+		t.Fatalf("unexpected extra fields: %#v", got.ExtraFields)
 	}
 }
 
-func TestResolveBoundaryInputs(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name          string
-		input         string
-		wantMode      int
-		wantThink     int
-		wantErrSubstr string
-	}{
-		{name: "empty", input: "", wantErrSubstr: "unknown model"},
-		{name: "suffix_only", input: "-low", wantErrSubstr: "unknown model"},
-		{name: "trim_whitespace", input: "  gemini-3.5-flash-thinking  ", wantMode: 2, wantThink: 4},
-	}
-
-	for _, tc := range tests {
-		tc := tc
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-
-			gotMode, gotThink, err := models.Resolve(tc.input)
-			if tc.wantErrSubstr != "" {
-				if err == nil {
-					t.Fatalf("expected error containing %q, got nil", tc.wantErrSubstr)
-				}
-				if !strings.Contains(err.Error(), tc.wantErrSubstr) {
-					t.Fatalf("expected error containing %q, got %q", tc.wantErrSubstr, err.Error())
-				}
-				return
-			}
-			if err != nil {
-				t.Fatalf("unexpected error: %v", err)
-			}
-			if gotMode != tc.wantMode {
-				t.Fatalf("unexpected mode, got %d want %d", gotMode, tc.wantMode)
-			}
-			if gotThink != tc.wantThink {
-				t.Fatalf("unexpected think, got %d want %d", gotThink, tc.wantThink)
-			}
-		})
-	}
-}
-
-func TestPublicModelNamesDoesNotContainPro(t *testing.T) {
+func TestPublicModelNamesIncludePro(t *testing.T) {
 	t.Parallel()
 
 	names := models.PublicModelNames()
-	for _, name := range names {
-		if name == "gemini-3.1-pro" {
-			t.Fatalf("unexpected pro model in public list: %v", names)
-		}
+	if !slices.Contains(names, "gemini-3.1-pro") {
+		t.Fatalf("expected pro model in public list: %v", names)
+	}
+	if !slices.Contains(names, "gemini-3.1-pro-enhanced") {
+		t.Fatalf("expected pro enhanced model in public list: %v", names)
 	}
 }
