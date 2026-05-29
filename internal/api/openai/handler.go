@@ -119,14 +119,22 @@ func (h *Handler) handleChatCompletions(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusBadRequest, "empty prompt")
 		return
 	}
+	if req.Stream && len(req.Tools) == 0 {
+		h.writeChatUpstreamPassthroughStream(w, r, resolved.Name, prompt, resolved.Mode, resolved.Think, &gemini.GenerateOptions{
+			ExtraFields: resolved.ExtraFields,
+		})
+		return
+	}
 
-	text, err := h.upstream.Generate(r.Context(), prompt, resolved.Mode, resolved.Think, &gemini.GenerateOptions{
+	result, err := h.upstream.GenerateDetailed(r.Context(), prompt, resolved.Mode, resolved.Think, &gemini.GenerateOptions{
 		ExtraFields: resolved.ExtraFields,
 	})
 	if err != nil {
 		writeError(w, http.StatusBadGateway, "upstream error: "+err.Error())
 		return
 	}
+	text := result.Text
+	reasoning := result.ReasoningSteps
 
 	cleanText := text
 	var toolCalls []parsedToolCall
@@ -139,6 +147,9 @@ func (h *Handler) handleChatCompletions(w http.ResponseWriter, r *http.Request) 
 		"role":    "assistant",
 		"content": cleanText,
 	}
+	if len(reasoning) > 0 {
+		message["reasoning_content"] = reasoning[len(reasoning)-1]
+	}
 	if len(toolCalls) > 0 {
 		finishReason = "tool_calls"
 		message["tool_calls"] = toolCalls
@@ -148,11 +159,11 @@ func (h *Handler) handleChatCompletions(w http.ResponseWriter, r *http.Request) 
 	}
 
 	if req.Stream && (len(req.Tools) == 0 || isToolChoiceNone(req.ToolChoice)) {
-		h.writeChatStream(w, resolved.Name, cleanText)
+		h.writeChatStream(w, resolved.Name, cleanText, reasoning)
 		return
 	}
 	if req.Stream {
-		h.writeChatToolAwareStream(w, resolved.Name, message, finishReason)
+		h.writeChatToolAwareStream(w, resolved.Name, message, finishReason, reasoning)
 		return
 	}
 
@@ -207,13 +218,15 @@ func (h *Handler) handleResponses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	text, err := h.upstream.Generate(r.Context(), prompt, resolved.Mode, resolved.Think, &gemini.GenerateOptions{
+	result, err := h.upstream.GenerateDetailed(r.Context(), prompt, resolved.Mode, resolved.Think, &gemini.GenerateOptions{
 		ExtraFields: resolved.ExtraFields,
 	})
 	if err != nil {
 		writeError(w, http.StatusBadGateway, "upstream error: "+err.Error())
 		return
 	}
+	text := result.Text
+	reasoning := result.ReasoningSteps
 
 	cleanText := text
 	var toolCalls []parsedToolCall
@@ -251,6 +264,27 @@ func (h *Handler) handleResponses(w http.ResponseWriter, r *http.Request) {
 			},
 		})
 	}
+	if len(reasoning) > 0 {
+		items := make([]map[string]any, 0, len(reasoning))
+		for _, step := range reasoning {
+			if strings.TrimSpace(step) == "" {
+				continue
+			}
+			items = append(items, map[string]any{
+				"type": "reasoning_text",
+				"text": step,
+			})
+		}
+		if len(items) > 0 {
+			output = append(output, map[string]any{
+				"type":    "reasoning",
+				"id":      "rs_" + rid,
+				"role":    "assistant",
+				"status":  "completed",
+				"content": items,
+			})
+		}
+	}
 
 	stream, _ := req["stream"].(bool)
 	if stream {
@@ -272,6 +306,16 @@ func (h *Handler) handleResponses(w http.ResponseWriter, r *http.Request) {
 		for _, item := range output {
 			itemType, _ := item["type"].(string)
 			switch itemType {
+			case "reasoning":
+				content, _ := item["content"].([]map[string]any)
+				for idx, part := range content {
+					writeSSEEvent(w, "response.reasoning_text.done", map[string]any{
+						"type":          "response.reasoning_text.done",
+						"item_id":       item["id"],
+						"content_index": idx,
+						"text":          part["text"],
+					})
+				}
 			case "function_call":
 				writeSSEEvent(w, "response.function_call_arguments.done", map[string]any{
 					"type":      "response.function_call_arguments.done",
@@ -494,43 +538,50 @@ func writeSSEEvent(w http.ResponseWriter, event string, payload any) {
 	_, _ = w.Write([]byte("data: " + string(raw) + "\n\n"))
 }
 
-func (h *Handler) writeChatStream(w http.ResponseWriter, model string, text string) {
+func (h *Handler) writeChatUpstreamPassthroughStream(w http.ResponseWriter, r *http.Request, model string, prompt string, mode, think int, opts *gemini.GenerateOptions) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 	w.WriteHeader(http.StatusOK)
 
-	chunk := map[string]any{
-		"id":      "chatcmpl_go",
-		"object":  "chat.completion.chunk",
-		"created": time.Now().Unix(),
-		"model":   model,
-		"choices": []map[string]any{
-			{
-				"index": 0,
-				"delta": map[string]any{
-					"role":    "assistant",
-					"content": text,
+	streamErr := h.upstream.StreamGenerate(r.Context(), prompt, mode, think, opts, func(chunk gemini.StreamChunk) error {
+		delta := map[string]any{
+			"content": chunk.DeltaText,
+		}
+		if chunk.ChunkNumber == 1 {
+			delta["role"] = "assistant"
+		}
+		payload := map[string]any{
+			"id":      "chatcmpl_go",
+			"object":  "chat.completion.chunk",
+			"created": time.Now().Unix(),
+			"model":   model,
+			"choices": []map[string]any{
+				{
+					"index":         0,
+					"delta":         delta,
+					"finish_reason": nil,
 				},
-				"finish_reason": "stop",
 			},
-		},
+		}
+		raw, _ := json.Marshal(payload)
+		_, _ = w.Write([]byte("data: " + string(raw) + "\n\n"))
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		return nil
+	})
+	if streamErr != nil {
+		errPayload := map[string]any{
+			"error": map[string]any{
+				"message": "upstream error: " + streamErr.Error(),
+				"type":    "api_error",
+			},
+		}
+		raw, _ := json.Marshal(errPayload)
+		_, _ = w.Write([]byte("data: " + string(raw) + "\n\n"))
 	}
-	raw, _ := json.Marshal(chunk)
-	_, _ = w.Write([]byte("data: " + string(raw) + "\n\n"))
-	_, _ = w.Write([]byte("data: [DONE]\n\n"))
-	if f, ok := w.(http.Flusher); ok {
-		f.Flush()
-	}
-}
-
-func (h *Handler) writeChatToolAwareStream(w http.ResponseWriter, model string, message map[string]any, finishReason string) {
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-	w.WriteHeader(http.StatusOK)
-
-	chunk := map[string]any{
+	doneChunk := map[string]any{
 		"id":      "chatcmpl_go",
 		"object":  "chat.completion.chunk",
 		"created": time.Now().Unix(),
@@ -538,12 +589,203 @@ func (h *Handler) writeChatToolAwareStream(w http.ResponseWriter, model string, 
 		"choices": []map[string]any{
 			{
 				"index":         0,
-				"delta":         message,
+				"delta":         map[string]any{},
+				"finish_reason": "stop",
+			},
+		},
+	}
+	raw, _ := json.Marshal(doneChunk)
+	_, _ = w.Write([]byte("data: " + string(raw) + "\n\n"))
+	_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	if f, ok := w.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+func streamTextChunks(text string) []string {
+	const chunkSize = 8
+	runes := []rune(text)
+	if len(runes) == 0 {
+		return nil
+	}
+	chunks := make([]string, 0, (len(runes)+chunkSize-1)/chunkSize)
+	for start := 0; start < len(runes); start += chunkSize {
+		end := start + chunkSize
+		if end > len(runes) {
+			end = len(runes)
+		}
+		chunks = append(chunks, string(runes[start:end]))
+	}
+	return chunks
+}
+
+func (h *Handler) writeChatStream(w http.ResponseWriter, model string, text string, reasoning []string) {
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.WriteHeader(http.StatusOK)
+	for _, step := range reasoning {
+		if strings.TrimSpace(step) == "" {
+			continue
+		}
+		reasoningChunk := map[string]any{
+			"id":      "chatcmpl_go",
+			"object":  "chat.completion.chunk",
+			"created": time.Now().Unix(),
+			"model":   model,
+			"choices": []map[string]any{
+				{
+					"index": 0,
+					"delta": map[string]any{
+						"reasoning":         step,
+						"reasoning_content": step,
+					},
+					"finish_reason": nil,
+				},
+			},
+		}
+		rawReasoning, _ := json.Marshal(reasoningChunk)
+		_, _ = w.Write([]byte("data: " + string(rawReasoning) + "\n\n"))
+	}
+
+	for idx, part := range streamTextChunks(text) {
+		delta := map[string]any{
+			"content": part,
+		}
+		if idx == 0 {
+			delta["role"] = "assistant"
+		}
+		chunk := map[string]any{
+			"id":      "chatcmpl_go",
+			"object":  "chat.completion.chunk",
+			"created": time.Now().Unix(),
+			"model":   model,
+			"choices": []map[string]any{
+				{
+					"index":         0,
+					"delta":         delta,
+					"finish_reason": nil,
+				},
+			},
+		}
+		raw, _ := json.Marshal(chunk)
+		_, _ = w.Write([]byte("data: " + string(raw) + "\n\n"))
+	}
+	doneChunk := map[string]any{
+		"id":      "chatcmpl_go",
+		"object":  "chat.completion.chunk",
+		"created": time.Now().Unix(),
+		"model":   model,
+		"choices": []map[string]any{
+			{
+				"index":         0,
+				"delta":         map[string]any{},
+				"finish_reason": "stop",
+			},
+		},
+	}
+	raw, _ := json.Marshal(doneChunk)
+	_, _ = w.Write([]byte("data: " + string(raw) + "\n\n"))
+	_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	if f, ok := w.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+func (h *Handler) writeChatToolAwareStream(w http.ResponseWriter, model string, message map[string]any, finishReason string, reasoning []string) {
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.WriteHeader(http.StatusOK)
+	for _, step := range reasoning {
+		if strings.TrimSpace(step) == "" {
+			continue
+		}
+		reasoningChunk := map[string]any{
+			"id":      "chatcmpl_go",
+			"object":  "chat.completion.chunk",
+			"created": time.Now().Unix(),
+			"model":   model,
+			"choices": []map[string]any{
+				{
+					"index": 0,
+					"delta": map[string]any{
+						"reasoning":         step,
+						"reasoning_content": step,
+					},
+					"finish_reason": nil,
+				},
+			},
+		}
+		rawReasoning, _ := json.Marshal(reasoningChunk)
+		_, _ = w.Write([]byte("data: " + string(rawReasoning) + "\n\n"))
+	}
+
+	if content, ok := message["content"].(string); ok && strings.TrimSpace(content) != "" {
+		baseMessage := make(map[string]any, len(message))
+		for key, value := range message {
+			baseMessage[key] = value
+		}
+		delete(baseMessage, "content")
+		for idx, part := range streamTextChunks(content) {
+			delta := map[string]any{
+				"content": part,
+			}
+			if idx == 0 {
+				for key, value := range baseMessage {
+					delta[key] = value
+				}
+				if _, ok := delta["role"]; !ok {
+					delta["role"] = "assistant"
+				}
+			}
+			chunk := map[string]any{
+				"id":      "chatcmpl_go",
+				"object":  "chat.completion.chunk",
+				"created": time.Now().Unix(),
+				"model":   model,
+				"choices": []map[string]any{
+					{
+						"index":         0,
+						"delta":         delta,
+						"finish_reason": nil,
+					},
+				},
+			}
+			raw, _ := json.Marshal(chunk)
+			_, _ = w.Write([]byte("data: " + string(raw) + "\n\n"))
+		}
+	} else {
+		chunk := map[string]any{
+			"id":      "chatcmpl_go",
+			"object":  "chat.completion.chunk",
+			"created": time.Now().Unix(),
+			"model":   model,
+			"choices": []map[string]any{
+				{
+					"index":         0,
+					"delta":         message,
+					"finish_reason": nil,
+				},
+			},
+		}
+		raw, _ := json.Marshal(chunk)
+		_, _ = w.Write([]byte("data: " + string(raw) + "\n\n"))
+	}
+	doneChunk := map[string]any{
+		"id":      "chatcmpl_go",
+		"object":  "chat.completion.chunk",
+		"created": time.Now().Unix(),
+		"model":   model,
+		"choices": []map[string]any{
+			{
+				"index":         0,
+				"delta":         map[string]any{},
 				"finish_reason": finishReason,
 			},
 		},
 	}
-	raw, _ := json.Marshal(chunk)
+	raw, _ := json.Marshal(doneChunk)
 	_, _ = w.Write([]byte("data: " + string(raw) + "\n\n"))
 	_, _ = w.Write([]byte("data: [DONE]\n\n"))
 	if f, ok := w.(http.Flusher); ok {

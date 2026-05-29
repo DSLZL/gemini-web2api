@@ -135,7 +135,7 @@ func TestStreamGenerateContentReturnsSSE(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		inner := make([]any, 5)
 		inner[4] = []any{
-			[]any{nil, []any{"stream answer"}},
+			[]any{nil, []any{"reasoning step", "stream answer"}},
 		}
 		innerJSON, _ := json.Marshal(inner)
 		line := []any{
@@ -164,6 +164,9 @@ func TestStreamGenerateContentReturnsSSE(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), "data: ") {
 		t.Fatalf("expected SSE data output, got: %s", rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "\"reasoning\"") {
+		t.Fatalf("expected reasoning in SSE payload, got: %s", rec.Body.String())
 	}
 }
 

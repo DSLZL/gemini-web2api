@@ -110,10 +110,10 @@ func TestGenerate_ParsesStreamGenerateLikePayload(t *testing.T) {
 	}
 }
 
-func TestExtractResponseText_EmptyInput(t *testing.T) {
+func TestExtractResponseTexts_EmptyInput(t *testing.T) {
 	t.Parallel()
-	if got := extractResponseText(""); got != "" {
-		t.Fatalf("expected empty string, got %q", got)
+	if got := extractResponseTexts(""); len(got) != 0 {
+		t.Fatalf("expected empty result, got %#v", got)
 	}
 }
 
@@ -167,6 +167,84 @@ func TestGenerate_PoolFallsBackOnEmptyResponse(t *testing.T) {
 	}
 	if got != "pool fallback answer" {
 		t.Fatalf("unexpected generated text: got %q want %q", got, "pool fallback answer")
+	}
+}
+
+func TestGenerateDetailed_ReturnsReasoningSteps(t *testing.T) {
+	t.Parallel()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		inner := make([]any, 5)
+		inner[4] = []any{
+			[]any{nil, []any{"reasoning step 1", "reasoning step 1 and step 2", "final answer"}},
+		}
+		innerJSON, _ := json.Marshal(inner)
+		line := []any{
+			[]any{"wrb.fr", nil, string(innerJSON)},
+		}
+		lineJSON, _ := json.Marshal(line)
+		_, _ = w.Write([]byte(string(lineJSON) + "\n"))
+	}))
+	defer srv.Close()
+
+	client := NewClient(Config{
+		Client:    srv.Client(),
+		ProxyBase: srv.URL,
+	})
+	result, err := client.GenerateDetailed(context.Background(), "hello", 1, 4, nil)
+	if err != nil {
+		t.Fatalf("generate detailed error: %v", err)
+	}
+	if result.Text != "final answer" {
+		t.Fatalf("unexpected final text: %q", result.Text)
+	}
+	if len(result.ReasoningSteps) == 0 {
+		t.Fatal("expected reasoning steps")
+	}
+	if !strings.Contains(strings.Join(result.ReasoningSteps, " "), "reasoning step 1") {
+		t.Fatalf("unexpected reasoning steps: %#v", result.ReasoningSteps)
+	}
+}
+
+func TestGenerateDetailed_PrefersLongestIncrementalTextAsFinal(t *testing.T) {
+	t.Parallel()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		entries := []string{
+			"我们可以",
+			"我们可以通过几种不同的方法来比较 13 × 17 和 14 × 16 的大小。",
+			"我们可以通过几种不同的方法来比较 13 × 17 和 14 × 16 的大小。结论：14 × 16 更大。",
+			"16 更大。",
+		}
+		for _, entry := range entries {
+			inner := make([]any, 5)
+			inner[4] = []any{
+				[]any{nil, []any{entry}},
+			}
+			innerJSON, _ := json.Marshal(inner)
+			line := []any{
+				[]any{"wrb.fr", nil, string(innerJSON)},
+			}
+			lineJSON, _ := json.Marshal(line)
+			_, _ = w.Write([]byte(string(lineJSON) + "\n"))
+		}
+	}))
+	defer srv.Close()
+
+	client := NewClient(Config{
+		Client:    srv.Client(),
+		ProxyBase: srv.URL,
+	})
+	result, err := client.GenerateDetailed(context.Background(), "hello", 1, 4, nil)
+	if err != nil {
+		t.Fatalf("generate detailed error: %v", err)
+	}
+	want := "我们可以通过几种不同的方法来比较 13 × 17 和 14 × 16 的大小。结论：14 × 16 更大。"
+	if result.Text != want {
+		t.Fatalf("unexpected final text: got %q want %q", result.Text, want)
+	}
+	if len(result.ReasoningSteps) != 0 {
+		t.Fatalf("expected no reasoning steps for incremental-only upstream text, got %#v", result.ReasoningSteps)
 	}
 }
 

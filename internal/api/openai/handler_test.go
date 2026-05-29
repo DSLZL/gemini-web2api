@@ -1,12 +1,15 @@
 package openai_test
 
 import (
+	"bufio"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"gemini-web2api/internal/api/openai"
 )
@@ -203,7 +206,7 @@ func TestChatCompletionsStreamReturnsDone(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		inner := make([]any, 5)
 		inner[4] = []any{
-			[]any{nil, []any{"ok from upstream"}},
+			[]any{nil, []any{"reasoning step", "ok from upstream"}},
 		}
 		innerJSON, _ := json.Marshal(inner)
 		line := []any{
@@ -236,7 +239,308 @@ func TestChatCompletionsStreamReturnsDone(t *testing.T) {
 	if !strings.Contains(body, "data: [DONE]") {
 		t.Fatalf("expected SSE done marker, got: %s", body)
 	}
-	if !strings.Contains(body, "ok from upstream") {
+	if !strings.Contains(body, "\"content\":\"ok from upstream\"") {
 		t.Fatalf("expected upstream text in SSE payload, got: %s", body)
+	}
+}
+
+func TestChatCompletionsIncludesReasoningContentForCherryStudio(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		inner := make([]any, 5)
+		inner[4] = []any{
+			[]any{nil, []any{"reasoning from upstream", "final output text"}},
+		}
+		innerJSON, _ := json.Marshal(inner)
+		line := []any{
+			[]any{"wrb.fr", nil, string(innerJSON)},
+		}
+		lineJSON, _ := json.Marshal(line)
+		_, _ = w.Write([]byte(string(lineJSON) + "\n"))
+	}))
+	defer srv.Close()
+
+	prev := os.Getenv("GEMINI_WEB2API_GEMINI_WEB_BASE")
+	_ = os.Setenv("GEMINI_WEB2API_GEMINI_WEB_BASE", srv.URL)
+	t.Cleanup(func() {
+		_ = os.Setenv("GEMINI_WEB2API_GEMINI_WEB_BASE", prev)
+	})
+
+	h := openai.NewHandler(nil)
+	req := httptest.NewRequest(
+		http.MethodPost,
+		"/v1/chat/completions",
+		strings.NewReader(`{"model":"gemini-3.5-flash-thinking","messages":[{"role":"user","content":"hi"}]}`),
+	)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unexpected status: got %d want %d, body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "\"reasoning_content\":\"reasoning from upstream\"") {
+		t.Fatalf("expected reasoning_content in non-stream chat response, got: %s", body)
+	}
+	if !strings.Contains(body, "\"content\":\"final output text\"") {
+		t.Fatalf("expected final content in non-stream chat response, got: %s", body)
+	}
+}
+
+func TestChatCompletionsStreamUsesReasoningContentDelta(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		inner := make([]any, 5)
+		inner[4] = []any{
+			[]any{nil, []any{"reasoning from upstream", "final output text"}},
+		}
+		innerJSON, _ := json.Marshal(inner)
+		line := []any{
+			[]any{"wrb.fr", nil, string(innerJSON)},
+		}
+		lineJSON, _ := json.Marshal(line)
+		_, _ = w.Write([]byte(string(lineJSON) + "\n"))
+	}))
+	defer srv.Close()
+
+	prev := os.Getenv("GEMINI_WEB2API_GEMINI_WEB_BASE")
+	_ = os.Setenv("GEMINI_WEB2API_GEMINI_WEB_BASE", srv.URL)
+	t.Cleanup(func() {
+		_ = os.Setenv("GEMINI_WEB2API_GEMINI_WEB_BASE", prev)
+	})
+
+	h := openai.NewHandler(nil)
+	req := httptest.NewRequest(
+		http.MethodPost,
+		"/v1/chat/completions",
+		strings.NewReader(`{"model":"gemini-3.5-flash-thinking","stream":true,"messages":[{"role":"user","content":"hi"}]}`),
+	)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unexpected status: got %d want %d", rec.Code, http.StatusOK)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "\"content\":\"final output text\"") {
+		t.Fatalf("expected final output text in SSE payload, got: %s", body)
+	}
+}
+
+func TestChatCompletionsStreamSplitsLargeTextIntoMultipleContentChunks(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		inner := make([]any, 5)
+		inner[4] = []any{
+			[]any{nil, []any{"第一段。第二段。第三段。第四段。第五段。第六段。"}},
+		}
+		innerJSON, _ := json.Marshal(inner)
+		line := []any{
+			[]any{"wrb.fr", nil, string(innerJSON)},
+		}
+		lineJSON, _ := json.Marshal(line)
+		_, _ = w.Write([]byte(string(lineJSON) + "\n"))
+	}))
+	defer srv.Close()
+
+	prev := os.Getenv("GEMINI_WEB2API_GEMINI_WEB_BASE")
+	_ = os.Setenv("GEMINI_WEB2API_GEMINI_WEB_BASE", srv.URL)
+	t.Cleanup(func() {
+		_ = os.Setenv("GEMINI_WEB2API_GEMINI_WEB_BASE", prev)
+	})
+
+	h := openai.NewHandler(nil)
+	req := httptest.NewRequest(
+		http.MethodPost,
+		"/v1/chat/completions",
+		strings.NewReader(`{"model":"gemini-3.5-flash","stream":true,"messages":[{"role":"user","content":"hi"}]}`),
+	)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unexpected status: got %d want %d", rec.Code, http.StatusOK)
+	}
+	body := rec.Body.String()
+	if strings.Count(body, "\"content\":\"第一段。第二段。第三段。第四段。第五段。第六段。\"") != 1 {
+		t.Fatalf("expected one passthrough content chunk for one upstream chunk, got: %s", body)
+	}
+}
+
+func TestChatCompletionsStreamForwardsEachUpstreamChunkImmediately(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		flusher, _ := w.(http.Flusher)
+		snapshots := []string{"你", "你好", "你好呀"}
+		for _, snapshot := range snapshots {
+			inner := make([]any, 5)
+			inner[4] = []any{
+				[]any{nil, []any{snapshot}},
+			}
+			innerJSON, _ := json.Marshal(inner)
+			line := []any{
+				[]any{"wrb.fr", nil, string(innerJSON)},
+			}
+			lineJSON, _ := json.Marshal(line)
+			_, _ = w.Write([]byte(string(lineJSON) + "\n"))
+			if flusher != nil {
+				flusher.Flush()
+			}
+		}
+	}))
+	defer srv.Close()
+
+	prev := os.Getenv("GEMINI_WEB2API_GEMINI_WEB_BASE")
+	_ = os.Setenv("GEMINI_WEB2API_GEMINI_WEB_BASE", srv.URL)
+	t.Cleanup(func() {
+		_ = os.Setenv("GEMINI_WEB2API_GEMINI_WEB_BASE", prev)
+	})
+
+	h := openai.NewHandler(nil)
+	req := httptest.NewRequest(
+		http.MethodPost,
+		"/v1/chat/completions",
+		strings.NewReader(`{"model":"gemini-3.5-flash","stream":true,"messages":[{"role":"user","content":"hi"}]}`),
+	)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unexpected status: got %d want %d", rec.Code, http.StatusOK)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, `"content":"你"`) ||
+		!strings.Contains(body, `"content":"好"`) ||
+		!strings.Contains(body, `"content":"呀"`) {
+		t.Fatalf("expected one SSE content delta per upstream chunk, got: %s", body)
+	}
+}
+
+func TestChatCompletionsStreamDeliversFirstChunkBeforeUpstreamCompletes(t *testing.T) {
+	firstChunkWritten := make(chan struct{}, 1)
+	releaseUpstream := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		flusher, _ := w.(http.Flusher)
+		inner := make([]any, 5)
+		inner[4] = []any{
+			[]any{nil, []any{"你"}},
+		}
+		innerJSON, _ := json.Marshal(inner)
+		line := []any{
+			[]any{"wrb.fr", nil, string(innerJSON)},
+		}
+		lineJSON, _ := json.Marshal(line)
+		_, _ = w.Write([]byte(string(lineJSON) + "\n"))
+		if flusher != nil {
+			flusher.Flush()
+		}
+		firstChunkWritten <- struct{}{}
+		<-releaseUpstream
+	}))
+	defer srv.Close()
+
+	prev := os.Getenv("GEMINI_WEB2API_GEMINI_WEB_BASE")
+	_ = os.Setenv("GEMINI_WEB2API_GEMINI_WEB_BASE", srv.URL)
+	t.Cleanup(func() {
+		_ = os.Setenv("GEMINI_WEB2API_GEMINI_WEB_BASE", prev)
+	})
+
+	h := openai.NewHandler(nil)
+	app := httptest.NewServer(h)
+	defer app.Close()
+
+	req, err := http.NewRequest(
+		http.MethodPost,
+		app.URL+"/v1/chat/completions",
+		strings.NewReader(`{"model":"gemini-3.5-flash","stream":true,"messages":[{"role":"user","content":"hi"}]}`),
+	)
+	if err != nil {
+		t.Fatalf("build request failed: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("do request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("unexpected status: got %d want %d, body=%s", resp.StatusCode, http.StatusOK, string(body))
+	}
+
+	select {
+	case <-firstChunkWritten:
+	case <-time.After(2 * time.Second):
+		t.Fatal("upstream did not write first chunk in time")
+	}
+
+	reader := bufio.NewReader(resp.Body)
+	lines := make(chan string, 1)
+	readErr := make(chan error, 1)
+	go func() {
+		for {
+			line, err := reader.ReadString('\n')
+			if err != nil {
+				readErr <- err
+				return
+			}
+			if strings.Contains(line, `"content":"你"`) {
+				lines <- line
+				return
+			}
+		}
+	}()
+
+	select {
+	case line := <-lines:
+		if !strings.Contains(line, `"content":"你"`) {
+			t.Fatalf("unexpected first stream line: %s", line)
+		}
+	case err := <-readErr:
+		t.Fatalf("stream ended before first chunk arrived: %v", err)
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("did not receive first SSE chunk before upstream completed")
+	}
+
+	close(releaseUpstream)
+}
+
+func TestResponsesStreamIncludesReasoningEvent(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		inner := make([]any, 5)
+		inner[4] = []any{
+			[]any{nil, []any{"reasoning from upstream", "final output text"}},
+		}
+		innerJSON, _ := json.Marshal(inner)
+		line := []any{
+			[]any{"wrb.fr", nil, string(innerJSON)},
+		}
+		lineJSON, _ := json.Marshal(line)
+		_, _ = w.Write([]byte(string(lineJSON) + "\n"))
+	}))
+	defer srv.Close()
+
+	prev := os.Getenv("GEMINI_WEB2API_GEMINI_WEB_BASE")
+	_ = os.Setenv("GEMINI_WEB2API_GEMINI_WEB_BASE", srv.URL)
+	t.Cleanup(func() {
+		_ = os.Setenv("GEMINI_WEB2API_GEMINI_WEB_BASE", prev)
+	})
+
+	h := openai.NewHandler(nil)
+	req := httptest.NewRequest(
+		http.MethodPost,
+		"/v1/responses",
+		strings.NewReader(`{"model":"gemini-3.5-flash-thinking","stream":true,"input":"hi"}`),
+	)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unexpected status: got %d want %d, body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "response.reasoning_text.done") {
+		t.Fatalf("expected reasoning event, got: %s", body)
+	}
+	if !strings.Contains(body, "reasoning from upstream") {
+		t.Fatalf("expected reasoning text in stream, got: %s", body)
 	}
 }

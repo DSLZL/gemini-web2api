@@ -115,13 +115,15 @@ func (h *Handler) handleGenerateContent(w http.ResponseWriter, r *http.Request, 
 		return
 	}
 
-	text, err := h.upstream.Generate(r.Context(), prompt, resolved.Mode, resolved.Think, &gemini.GenerateOptions{
+	result, err := h.upstream.GenerateDetailed(r.Context(), prompt, resolved.Mode, resolved.Think, &gemini.GenerateOptions{
 		ExtraFields: resolved.ExtraFields,
 	})
 	if err != nil {
 		writeGoogleError(w, http.StatusBadGateway, "upstream error: "+err.Error())
 		return
 	}
+	text := result.Text
+	reasoning := result.ReasoningSteps
 
 	fcMode := strings.ToUpper(strings.TrimSpace(req.ToolConfig.FunctionCallingConfig.Mode))
 	hasTools := len(req.Tools) > 0 && fcMode != "NONE"
@@ -151,6 +153,18 @@ func (h *Handler) handleGenerateContent(w http.ResponseWriter, r *http.Request, 
 		}
 		responseParts = append(responseParts, map[string]any{"text": fallback})
 	}
+	if len(reasoning) > 0 {
+		for _, step := range reasoning {
+			if strings.TrimSpace(step) == "" {
+				continue
+			}
+			responseParts = append(responseParts, map[string]any{
+				"reasoning": map[string]any{
+					"text": step,
+				},
+			})
+		}
+	}
 
 	responseObj := map[string]any{
 		"candidates": []map[string]any{
@@ -175,6 +189,32 @@ func (h *Handler) handleGenerateContent(w http.ResponseWriter, r *http.Request, 
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
 		w.WriteHeader(http.StatusOK)
+		for _, step := range reasoning {
+			if strings.TrimSpace(step) == "" {
+				continue
+			}
+			reasoningObj := map[string]any{
+				"candidates": []map[string]any{
+					{
+						"index": 0,
+						"content": map[string]any{
+							"role": "model",
+							"parts": []map[string]any{
+								{
+									"reasoning": map[string]any{
+										"text": step,
+									},
+								},
+							},
+						},
+						"finishReason": "STOP",
+					},
+				},
+				"modelVersion": resolved.Name,
+			}
+			rawReasoning, _ := json.Marshal(reasoningObj)
+			_, _ = w.Write([]byte("data: " + string(rawReasoning) + "\n\n"))
+		}
 		raw, _ := json.Marshal(responseObj)
 		_, _ = w.Write([]byte("data: " + string(raw) + "\n\n"))
 		if f, ok := w.(http.Flusher); ok {

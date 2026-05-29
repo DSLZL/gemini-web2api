@@ -1,6 +1,7 @@
 package gemini
 
 import (
+	"bufio"
 	"context"
 	"crypto/sha1"
 	"encoding/base64"
@@ -66,6 +67,21 @@ type GenerateOptions struct {
 	ExtraFields map[int]any
 }
 
+// GenerateResult carries final answer text and optional reasoning trace.
+type GenerateResult struct {
+	Text           string
+	ReasoningSteps []string
+}
+
+// StreamChunk is one parsed upstream text snapshot and its delta against the previous snapshot.
+type StreamChunk struct {
+	FullText    string
+	DeltaText   string
+	Reasoning   string
+	RawLine     string
+	ChunkNumber int
+}
+
 // NewClient creates a StreamGenerate client.
 func NewClient(cfg Config) *Client {
 	httpClient := cfg.Client
@@ -119,16 +135,20 @@ func NewClient(cfg Config) *Client {
 
 // Generate sends a StreamGenerate request and extracts final text.
 func (c *Client) Generate(ctx context.Context, prompt string, mode, think int, opts *GenerateOptions) (string, error) {
+	result, err := c.GenerateDetailed(ctx, prompt, mode, think, opts)
+	if err != nil {
+		return "", err
+	}
+	return result.Text, nil
+}
+
+// StreamGenerate forwards each upstream text snapshot through onChunk without waiting for full completion.
+func (c *Client) StreamGenerate(ctx context.Context, prompt string, mode, think int, opts *GenerateOptions, onChunk func(StreamChunk) error) error {
+	if onChunk == nil {
+		return errors.New("stream callback is required")
+	}
 	if c.pool == nil {
-		raw, err := c.streamGenerate(ctx, prompt, mode, think, c.proxyBase, opts)
-		if err != nil {
-			return "", err
-		}
-		text, err := parseStreamText(raw)
-		if err != nil {
-			return "", err
-		}
-		return text, nil
+		return c.streamGenerateWithCallback(ctx, prompt, mode, think, c.proxyBase, opts, onChunk)
 	}
 
 	now := time.Now()
@@ -144,7 +164,51 @@ func (c *Client) Generate(ctx context.Context, prompt string, mode, think int, o
 		candidates = append(candidates, c.proxyBase)
 	}
 	if len(candidates) == 0 {
-		return "", errors.New("no upstream nodes configured")
+		return errors.New("no upstream nodes configured")
+	}
+
+	var errs []error
+	for _, base := range candidates {
+		err := c.streamGenerateWithCallback(ctx, prompt, mode, think, base, opts, onChunk)
+		if err != nil {
+			c.pool.RecordFailure(base, time.Now())
+			errs = append(errs, fmt.Errorf("%s: %w", base, err))
+			continue
+		}
+		c.pool.RecordSuccess(base, time.Now())
+		return nil
+	}
+	return errors.Join(errs...)
+}
+
+// GenerateDetailed sends a StreamGenerate request and returns text plus reasoning trace.
+func (c *Client) GenerateDetailed(ctx context.Context, prompt string, mode, think int, opts *GenerateOptions) (GenerateResult, error) {
+	if c.pool == nil {
+		raw, err := c.streamGenerate(ctx, prompt, mode, think, c.proxyBase, opts)
+		if err != nil {
+			return GenerateResult{}, err
+		}
+		result, err := parseStreamText(raw)
+		if err != nil {
+			return GenerateResult{}, err
+		}
+		return result, nil
+	}
+
+	now := time.Now()
+	primary, probe := c.pool.Select(now)
+	candidates := make([]string, 0, 2)
+	if primary != "" {
+		candidates = append(candidates, primary)
+	}
+	if probe != "" && probe != primary {
+		candidates = append(candidates, probe)
+	}
+	if len(candidates) == 0 && c.proxyBase != "" {
+		candidates = append(candidates, c.proxyBase)
+	}
+	if len(candidates) == 0 {
+		return GenerateResult{}, errors.New("no upstream nodes configured")
 	}
 
 	var errs []error
@@ -155,7 +219,7 @@ func (c *Client) Generate(ctx context.Context, prompt string, mode, think int, o
 			errs = append(errs, fmt.Errorf("%s: %w", base, err))
 			continue
 		}
-		text, parseErr := parseStreamText(raw)
+		result, parseErr := parseStreamText(raw)
 		if parseErr != nil {
 			if errors.Is(parseErr, ErrEmptyResponse) {
 				c.pool.RecordFailure(base, time.Now())
@@ -164,10 +228,10 @@ func (c *Client) Generate(ctx context.Context, prompt string, mode, think int, o
 			continue
 		}
 		c.pool.RecordSuccess(base, time.Now())
-		return text, nil
+		return result, nil
 	}
 
-	return "", errors.Join(errs...)
+	return GenerateResult{}, errors.Join(errs...)
 }
 
 func (c *Client) streamGenerate(ctx context.Context, prompt string, mode, think int, base string, opts *GenerateOptions) (string, error) {
@@ -277,18 +341,199 @@ func (c *Client) streamGenerate(ctx context.Context, prompt string, mode, think 
 	return string(body), nil
 }
 
-func parseStreamText(raw string) (string, error) {
-	text := extractResponseText(raw)
-	if strings.TrimSpace(text) != "" {
-		return text, nil
+func (c *Client) streamGenerateWithCallback(ctx context.Context, prompt string, mode, think int, base string, opts *GenerateOptions, onChunk func(StreamChunk) error) error {
+	req, err := c.buildStreamRequest(ctx, prompt, mode, think, base, opts)
+	if err != nil {
+		return err
 	}
-	if code, ok := extractBardErrorCode(raw); ok {
-		return "", fmt.Errorf("gemini web upstream rejected request (BardErrorInfo %d); anonymous mode may be blocked and cookie/nonce may be required", code)
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return err
 	}
-	return "", ErrEmptyResponse
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("upstream status %d", resp.StatusCode)
+	}
+	return scanStreamChunks(resp.Body, onChunk)
 }
 
-func extractResponseText(raw string) string {
+func (c *Client) buildStreamRequest(ctx context.Context, prompt string, mode, think int, base string, opts *GenerateOptions) (*http.Request, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(prompt) == "" {
+		return nil, errors.New("empty prompt")
+	}
+
+	inner := make([]any, 102)
+	inner[0] = []any{prompt, 0, nil, nil, nil, nil, 0}
+	inner[1] = []any{"en"}
+	inner[2] = []any{"", "", "", nil, nil, nil, nil, nil, nil, ""}
+	inner[6] = []any{0}
+	inner[7] = 1
+	inner[10] = 1
+	inner[11] = 0
+	inner[17] = []any{[]any{think}}
+	inner[18] = 0
+	inner[27] = 1
+	inner[30] = []any{4}
+	inner[41] = []any{2}
+	inner[53] = 0
+	inner[59] = uuidString()
+	inner[61] = []any{}
+	inner[68] = 1
+	inner[79] = mode
+	if opts != nil {
+		for key, value := range opts.ExtraFields {
+			if key < 0 {
+				continue
+			}
+			if key >= len(inner) {
+				extended := make([]any, key+1)
+				copy(extended, inner)
+				inner = extended
+			}
+			inner[key] = value
+		}
+	}
+
+	innerJSON, err := json.Marshal(inner)
+	if err != nil {
+		return nil, fmt.Errorf("marshal inner payload: %w", err)
+	}
+	outer := []any{nil, string(innerJSON)}
+	outerJSON, err := json.Marshal(outer)
+	if err != nil {
+		return nil, fmt.Errorf("marshal outer payload: %w", err)
+	}
+
+	form := url.Values{}
+	form.Set("f.req", string(outerJSON))
+	reqID := time.Now().Unix() % 1000000
+	target := "https://gemini.google.com/_/BardChatUi/data/assistant.lamda.BardFrontendService/StreamGenerate"
+	trimmedBase := strings.TrimRight(strings.TrimSpace(base), "/")
+	if trimmedBase != "" {
+		target = trimmedBase + "/_/BardChatUi/data/assistant.lamda.BardFrontendService/StreamGenerate"
+	}
+	target = target + "?bl=" + url.QueryEscape(c.bl) + "&hl=en&_reqid=" + strconv.FormatInt(reqID, 10) + "&rt=c"
+
+	resinHeaders := make(http.Header)
+	if c.resinOn {
+		outURL, outHeaders, err := resin.BuildOutbound(c.resinCfg, c.resinID, target)
+		if err != nil {
+			return nil, fmt.Errorf("build resin outbound: %w", err)
+		}
+		target = outURL
+		resinHeaders = outHeaders
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, target, strings.NewReader(form.Encode()))
+	if err != nil {
+		return nil, fmt.Errorf("build stream request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Origin", "https://gemini.google.com")
+	req.Header.Set("Referer", "https://gemini.google.com/app")
+	req.Header.Set("X-Same-Domain", "1")
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+	for key, values := range resinHeaders {
+		for _, value := range values {
+			req.Header.Add(key, value)
+		}
+	}
+	if c.cookie != "" {
+		req.Header.Set("Cookie", c.cookie)
+	}
+	if c.auth && c.sapisid != "" {
+		req.Header.Set("Authorization", makeSAPISIDHash(c.sapisid))
+	}
+	return req, nil
+}
+
+func scanStreamChunks(r io.Reader, onChunk func(StreamChunk) error) error {
+	reader := bufio.NewReader(r)
+	var raw strings.Builder
+	lastText := ""
+	chunkNo := 0
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil && !errors.Is(err, io.EOF) {
+			return err
+		}
+		if line != "" {
+			raw.WriteString(line)
+			trimmed := strings.TrimRight(line, "\r\n")
+			if strings.Contains(trimmed, "\"wrb.fr\"") {
+				texts := extractResponseTexts(trimmed)
+				if len(texts) > 0 {
+					full := strings.TrimSpace(texts[len(texts)-1])
+					if full != "" && full != lastText {
+						delta := full
+						if strings.HasPrefix(full, lastText) {
+							delta = strings.TrimSpace(full[len(lastText):])
+						}
+						if delta != "" {
+							chunkNo++
+							if err := onChunk(StreamChunk{
+								FullText:    full,
+								DeltaText:   delta,
+								RawLine:     trimmed,
+								ChunkNumber: chunkNo,
+							}); err != nil {
+								return err
+							}
+						}
+						lastText = full
+					}
+				}
+			}
+		}
+		if errors.Is(err, io.EOF) {
+			break
+		}
+	}
+	if chunkNo == 0 {
+		if code, ok := extractBardErrorCode(raw.String()); ok {
+			return fmt.Errorf("gemini web upstream rejected request (BardErrorInfo %d); anonymous mode may be blocked and cookie/nonce may be required", code)
+		}
+		return ErrEmptyResponse
+	}
+	return nil
+}
+
+func parseStreamText(raw string) (GenerateResult, error) {
+	texts := extractResponseTexts(raw)
+	if len(texts) > 0 {
+		if isIncrementalTextStream(texts) {
+			return GenerateResult{
+				Text: longestText(texts),
+			}, nil
+		}
+		if final, ok := recoverFragmentedFinalText(texts); ok {
+			return GenerateResult{
+				Text: final,
+			}, nil
+		}
+
+		finalText := strings.TrimSpace(texts[len(texts)-1])
+		reasoning := make([]string, 0, len(texts)-1)
+		for i := 0; i < len(texts)-1; i++ {
+			if segment := strings.TrimSpace(texts[i]); segment != "" {
+				reasoning = append(reasoning, segment)
+			}
+		}
+		return GenerateResult{
+			Text:           finalText,
+			ReasoningSteps: reasoning,
+		}, nil
+	}
+	if code, ok := extractBardErrorCode(raw); ok {
+		return GenerateResult{}, fmt.Errorf("gemini web upstream rejected request (BardErrorInfo %d); anonymous mode may be blocked and cookie/nonce may be required", code)
+	}
+	return GenerateResult{}, ErrEmptyResponse
+}
+
+func extractResponseTexts(raw string) []string {
 	lines := strings.Split(raw, "\n")
 	texts := make([]string, 0, 8)
 	for _, line := range lines {
@@ -326,21 +571,76 @@ func extractResponseText(raw string) string {
 			}
 			for _, t := range txtArr {
 				if s, ok := t.(string); ok && s != "" {
-					texts = append(texts, s)
+					texts = append(texts, cleanGeminiText(s))
 				}
 			}
 		}
 	}
-	for i := len(texts) - 1; i >= 0; i-- {
-		if strings.TrimSpace(texts[i]) != "" {
-			return cleanGeminiText(texts[i])
+	out := make([]string, 0, len(texts))
+	last := ""
+	for _, text := range texts {
+		trimmed := strings.TrimSpace(text)
+		if trimmed == "" {
+			continue
 		}
+		if trimmed == last {
+			continue
+		}
+		out = append(out, trimmed)
+		last = trimmed
 	}
-	return ""
+	return out
 }
 
 func cleanGeminiText(text string) string {
 	return strings.TrimSpace(reCodeArtifacts.ReplaceAllString(text, ""))
+}
+
+func isIncrementalTextStream(texts []string) bool {
+	if len(texts) <= 1 {
+		return true
+	}
+	for i := 1; i < len(texts); i++ {
+		prev := strings.TrimSpace(texts[i-1])
+		curr := strings.TrimSpace(texts[i])
+		if prev == "" || curr == "" {
+			continue
+		}
+		if !strings.HasPrefix(curr, prev) {
+			return false
+		}
+	}
+	return true
+}
+
+func longestText(texts []string) string {
+	longest := ""
+	for _, text := range texts {
+		trimmed := strings.TrimSpace(text)
+		if len(trimmed) > len(longest) {
+			longest = trimmed
+		}
+	}
+	return longest
+}
+
+func recoverFragmentedFinalText(texts []string) (string, bool) {
+	longest := longestText(texts)
+	last := strings.TrimSpace(texts[len(texts)-1])
+	if longest == "" || last == "" || longest == last {
+		return "", false
+	}
+	for _, text := range texts {
+		trimmed := strings.TrimSpace(text)
+		if trimmed == "" || trimmed == longest {
+			continue
+		}
+		if strings.HasPrefix(longest, trimmed) || strings.Contains(longest, trimmed) {
+			continue
+		}
+		return "", false
+	}
+	return longest, true
 }
 
 func extractBardErrorCode(raw string) (int, bool) {
